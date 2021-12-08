@@ -509,11 +509,7 @@ class ClientToProxyHelper(ConnectionHandler):
 
             # Wrapping in TLS session (MitM), hopping that the client is looking
             # for a TLS session
-            try:
-                self.wrap()
-            except RuntimeError as e:
-                self.logger.exception(e)
-                raise
+            self.wrap()
 
         else:
             # This is not HTTPS, probably straight HTTP
@@ -604,7 +600,7 @@ class Proxy:
                 try:
                     self.handle_connection(clt2prx_con)
                 except Exception as e:
-                    self.logger.exception(e)
+                    self.logger.error(e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
                     return
 
     def _get_creds(self, srv_host):
@@ -629,7 +625,11 @@ class Proxy:
             return
 
         # Establish TLS if needed (between client and proxy)
-        srv_host, srv_port = clt2prx_hdler.prepare(clt_events)
+        try:
+            srv_host, srv_port = clt2prx_hdler.prepare(clt_events)
+        except Exception as e:
+            self.logger.error(e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
+            return
 
         try:
             # Create handler to manage connection between proxy and server
