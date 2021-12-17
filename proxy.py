@@ -764,9 +764,9 @@ def main():
                         help="CA private key passphrase.")
 
     # Generated certificates options
-    parser.add_argument("--certsdir", default="/tmp/proxizy",
+    parser.add_argument("--certsdir", default="/tmp/Prox-Ez",
                         help="Path to the directory the generated certificates will be stored in,\
-                        defaults to /tmp/proxizy. Will be created if it does not exists.")
+                        defaults to /tmp/Prox-Ez. Will be created if it does not exists.")
 
     # Multiprocessing
     parser.add_argument("--singleprocess", "-sp", action="store_true",

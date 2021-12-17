@@ -1,4 +1,4 @@
-# Proxizy
+# Prox-Ez
 
 The easy proxy to handle your NTLM EPA authentication against webservers.
 
@@ -50,7 +50,7 @@ optional arguments:
                         exists.
   --cakey-pass CAKEY_PASS
                         CA private key passphrase.
-  --certsdir CERTSDIR   Path to the directory the generated certificates will be stored in, defaults to /tmp/proxizy.
+  --certsdir CERTSDIR   Path to the directory the generated certificates will be stored in, defaults to /tmp/Prox-Ez.
                         Will be created if it does not exists.
   --singleprocess, -sp  Do you want to be slowwwww ?! Actually useful during debug.
   --debug, -d           Increase debug output.
