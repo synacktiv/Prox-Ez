@@ -4,6 +4,7 @@ Proxifier.
 
 # Basic imports
 import socket
+import datetime
 import ssl
 import logging
 import base64
@@ -13,11 +14,13 @@ import json
 import select
 import ipaddress
 import h11
+import typing
 from typing import Union, Tuple, List
 from time import sleep
 
 # Manage NTLM authentification
 import spnego
+from spnego._text import to_text
 
 # Multiprocessing
 from multiprocessing import Process
@@ -35,6 +38,18 @@ from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from h11 import LocalProtocolError, RemoteProtocolError
+
+
+#Manage Kerberos
+
+from impacket.spnego import ASN1_AID, SPNEGO_NegTokenInit, TypesMech
+from impacket.krb5.asn1 import AP_REQ, Authenticator, TGS_REP, seq_set
+from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS
+from impacket.krb5.types import Principal, KerberosTime, Ticket
+from impacket.krb5 import constants
+from pyasn1.codec.ber import encoder, decoder
+from pyasn1.type.univ import noValue
+
 
 RECV_SIZE = 1024
 SOCKET_TIMEOUT = 2
@@ -223,7 +238,7 @@ class ProxyToServerHelper(ConnectionHandler):
     Connect to remote socket with TLS.
     """
 
-    def __init__(self, use_tls: bool, hostname: str, port: int):
+    def __init__(self, use_tls: bool, hostname: str, port: int, is_kerberos):
         super().__init__()
 
         self.logger = logging.getLogger("Proxy.ProxyToServerHelper")
@@ -233,6 +248,7 @@ class ProxyToServerHelper(ConnectionHandler):
         self.use_tls = use_tls  # Should the connection be on top of TLS
 
         self.auth = None
+        self.is_kerberos = is_kerberos
 
         # Remote hostname & port
         self.hostname = hostname
@@ -286,6 +302,48 @@ class ProxyToServerHelper(ConnectionHandler):
             channel_bindings=channel_bindings,
         )
 
+    def kerberos_auth(self,domain,username,password,kdcHost):
+
+                user = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+                tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(user, password, domain,"" ,"","",kdcHost)
+                spn = self.hostname.replace("."+domain,"")
+                serverName = Principal('HTTP/'+spn, type=constants.PrincipalNameType.NT_SRV_INST.value)
+                tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(serverName,domain ,kdcHost , tgt, cipher,sessionKey)
+                blob = SPNEGO_NegTokenInit()
+                blob['MechTypes'] = [TypesMech['MS KRB5 - Microsoft Kerberos 5'],TypesMech['KRB5 - Kerberos 5'],TypesMech['NEGOEX - SPNEGO Extended Negotiation Security Mechanism'],TypesMech['NTLMSSP - Microsoft NTLM Security Support Provider']]
+
+
+                tgs = decoder.decode(tgs, asn1Spec=TGS_REP())[0]
+                ticket = Ticket()
+                ticket.from_asn1(tgs['ticket'])
+
+                apReq = AP_REQ()
+                apReq['pvno'] = 5
+                apReq['msg-type'] = int(constants.ApplicationTagNumbers.AP_REQ.value)
+
+                opts = [2]
+                apReq['ap-options'] = constants.encodeFlags(opts)
+                seq_set(apReq, 'ticket', ticket.to_asn1)
+
+                authenticator = Authenticator()
+                authenticator['authenticator-vno'] = 5
+                authenticator['crealm'] = domain
+                seq_set(authenticator, 'cname', user.components_to_asn1)
+                now = datetime.datetime.utcnow()
+
+                authenticator['cusec'] = now.microsecond
+                authenticator['ctime'] = KerberosTime.to_asn1(now)
+                encodedAuthenticator = encoder.encode(authenticator)
+                encryptedEncodedAuthenticator = cipher.encrypt(sessionKey, 11, encodedAuthenticator, None)
+
+                apReq['authenticator'] = noValue
+                apReq['authenticator']['etype'] = cipher.enctype
+                apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
+
+                blob['MechToken'] = encoder.encode(apReq)
+                authenticate = base64.b64encode(blob.getData())
+                self.auth = authenticate
+
     def check_auth(self, http_response: List[Union[h11.Response, h11.Data]]) -> Union[None, bytes]:
         """Given an HTTP response, will generate a corresponding NTLM authentication HTTP
         header value or will return None. May raise RuntimeException in case there is a problem.
@@ -308,6 +366,9 @@ class ProxyToServerHelper(ConnectionHandler):
             # Not NTLM authentication
             return None
 
+        if www_authenticate[0].startswith("Negotiate oYGh"):
+            return None
+            
         if www_authenticate[0].startswith("NTLM") and len(www_authenticate[0]) > 5:
             # If NTLMSSP_CHALLENGE, should be the only one WWW_AUTHENTICATE header returned by the server
             # NTLMSSP_CHALLENGE message
@@ -328,7 +389,11 @@ class ProxyToServerHelper(ConnectionHandler):
         else:
             prepend = b"NEGOTIATE "
         try:
-            return prepend + base64.b64encode(self.auth.step(None))
+            if self.is_kerberos: #perform Kerberos Authentication
+                return b"Negotiate " + self.auth 
+
+            else: # perform NTLM
+                return prepend + base64.b64encode(self.auth.step(None))
         except TypeError:
             # This is the second time we received a NTLM NEGOTIATE message
             # meaning that the authentication failed. We just forward the response
@@ -382,6 +447,7 @@ class ClientToProxyHelper(ConnectionHandler):
 
         self.sock = sock
         self.curr_sock = self.sock
+
 
         self.use_tls = False
         self.remote_host = None
@@ -528,7 +594,7 @@ class Proxy:
     Listens on a local port for SSL connections.
     """
 
-    def __init__(self, listen_address: str, listen_port: int, cert_manager: CertManager, is_multiprocess: bool = False, creds: dict = None):
+    def __init__(self, listen_address: str, listen_port: int, cert_manager: CertManager, dcip: str="", is_kerberos: bool = False, is_multiprocess: bool = False, creds: dict = None):
         self.logger = logging.getLogger("Proxy")
 
         self.prx_sock = None  # Proxy socket that waits for client connections
@@ -542,6 +608,9 @@ class Proxy:
 
         self.creds = creds  # List of credentials
 
+        self.is_kerberos = is_kerberos # Will perform kerberos authentication if available
+        self.kdcHost = dcip # ip address of the KDC for kerberos authentication
+       
     def __enter__(self):
         self.logger.debug("Entered proxy, creating sockets.")
         self.prx_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
@@ -612,6 +681,20 @@ class Proxy:
         password = self.creds[_]["password"]
         self.logger.debug("Using user %s with password %s for %s.", username, password, srv_host)
         return username, password
+    
+    def  split_username(self,username: typing.Optional[str]) -> typing.Tuple[typing.Optional[str], typing.Optional[str]]:
+         if username is None:
+              return None, None
+
+         domain: typing.Optional[str]
+         if '\\' in username:
+              domain, username = username.split('\\', 1)
+         else:
+              domain = None
+
+         return to_text(domain, nonstring='passthru'), to_text(username, nonstring='passthru')
+
+
 
     def handle_connection(self, clt2prx_con: socket.socket) -> None:
         """Handle a client connection to the proxy."""
@@ -633,7 +716,7 @@ class Proxy:
 
         try:
             # Create handler to manage connection between proxy and server
-            prx2srv_hdler = ProxyToServerHelper(clt2prx_hdler.use_tls, srv_host, srv_port)
+            prx2srv_hdler = ProxyToServerHelper(clt2prx_hdler.use_tls, srv_host, srv_port, self.is_kerberos)
         except (TimeoutError, socket.timeout):
             self.logger.warning("Request to %s:%s timed out.", srv_host, srv_port)
             clt2prx_hdler.stop()
@@ -663,7 +746,11 @@ class Proxy:
         # Current status of NTLM authentication for this proxy2server connection (may not be used)
         username, password = self._get_creds(srv_host)
 
-        prx2srv_hdler.init_auth(username, password)
+        if self.is_kerberos :
+            domain, username = self.split_username(username)
+            prx2srv_hdler.kerberos_auth(domain,username,password, self.kdcHost)
+        else:
+            prx2srv_hdler.init_auth(username, password)
 
         last_loop = False
         while True:
@@ -753,6 +840,9 @@ def main():
     parser.add_argument("--listen-port", "-p", default=3128, type=int,
                         help="Port the proxy will be listening on, defaults to 3128.")
 
+    
+
+
     # CA options
     parser.add_argument("--cacert", default="./cacert.pem",
                         help="Filepath to the CA certificate, defaults to ./cacert.pem.\
@@ -781,18 +871,25 @@ def main():
                         help="""Path to the credentials file, for instance:
 {
     "my.hostname.com": {
-        "username": "domain/user",
+        "username": "domain\\user",
         "password": "password"
     }, "my.second.hostname.com": {
-        "username": "domain1/user1",
+        "username": "domain1\\user1",
         "password": "password1"
     }
 }
 """)
     parser.add_argument("--default_username", "-du", default="user",
-                        help="Default username to use. In the form domain/user.")
+                        help="Default username to use. In the form domain\\\\user.")
     parser.add_argument("--default_password", "-dp", default="password",
                         help="Default password to use.")
+
+    
+
+    # Kerberos authentication options
+    parser.add_argument("--kerberos", "-k", action="store_true", help="Enable kerberos authentication instead of NTLM")
+    parser.add_argument('--dcip', action='store',  help="IP Address of the domain controller (only for kerberos)")
+    
 
     args = parser.parse_args()
 
@@ -820,7 +917,7 @@ def main():
             "password": args.default_password
         }
     })
-    with Proxy(args.listen_address, args.listen_port, cert_manager, is_multiprocess=not args.singleprocess, creds=credentials) as proxy:
+    with Proxy(args.listen_address, args.listen_port, cert_manager, args.dcip, is_kerberos=args.kerberos, is_multiprocess=not args.singleprocess, creds=credentials) as proxy:
         proxy.run()
 
 
