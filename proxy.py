@@ -296,8 +296,9 @@ class ProxyToServerHelper(ConnectionHandler):
         self.auth = spnego.client(
             username=username,
             password=password,
+            #hostname="toto",
             hostname=self.hostname,
-            service="HTTP",
+            service="HSJK",
             protocol="ntlm",
             channel_bindings=channel_bindings,
         )
@@ -379,6 +380,22 @@ class ProxyToServerHelper(ConnectionHandler):
                     base64.b64decode(www_authenticate[0][5:])
                 )
             )
+
+        if www_authenticate[0].startswith('Negotiate TlRMT'):
+             self.logger.debug("Got NTLM CHALLENGE from Negotiate")
+             # Detecting NTLMSSP_CHALLENGE from a Negotiate Header
+             # Sending NTLMSSP_AUTH message
+             return b"Negotiate " + base64.b64encode(
+                     self.auth.step(
+                         base64.b64decode(www_authenticate[0][10:])
+                         )
+                     )
+
+        if www_authenticate[0].startswith('Negotiate YIG') and not self.is_kerberos:
+            # Remote server only accept Negotiate:Kerberos
+            self.logger.warning("Remore server only accept Kerberos authentication, consider using -k option.")
+            raise RuntimeError("Authentication failed.")
+
 
         # Initial 401 unauthorized request
         # Sending NTLMSSP_NEGOTIATE message
