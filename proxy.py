@@ -305,45 +305,45 @@ class ProxyToServerHelper(ConnectionHandler):
 
     def kerberos_auth(self,domain,username,password,kdcHost):
 
-                user = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
-                tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(user, password, domain,"" ,"","",kdcHost)
-                spn = self.hostname.replace("."+domain,"")
-                serverName = Principal('HTTP/'+spn, type=constants.PrincipalNameType.NT_SRV_INST.value)
-                tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(serverName,domain ,kdcHost , tgt, cipher,sessionKey)
-                blob = SPNEGO_NegTokenInit()
-                blob['MechTypes'] = [TypesMech['MS KRB5 - Microsoft Kerberos 5'],TypesMech['KRB5 - Kerberos 5'],TypesMech['NEGOEX - SPNEGO Extended Negotiation Security Mechanism'],TypesMech['NTLMSSP - Microsoft NTLM Security Support Provider']]
+        user = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+        tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(user, password, domain,"" ,"","",kdcHost)
+        spn = self.hostname.replace("."+domain,"")
+        serverName = Principal('HTTP/'+spn, type=constants.PrincipalNameType.NT_SRV_INST.value)
+        tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(serverName,domain ,kdcHost , tgt, cipher,sessionKey)
+        blob = SPNEGO_NegTokenInit()
+        blob['MechTypes'] = [TypesMech['MS KRB5 - Microsoft Kerberos 5'],TypesMech['KRB5 - Kerberos 5'],TypesMech['NEGOEX - SPNEGO Extended Negotiation Security Mechanism'],TypesMech['NTLMSSP - Microsoft NTLM Security Support Provider']]
 
 
-                tgs = decoder.decode(tgs, asn1Spec=TGS_REP())[0]
-                ticket = Ticket()
-                ticket.from_asn1(tgs['ticket'])
+        tgs = decoder.decode(tgs, asn1Spec=TGS_REP())[0]
+        ticket = Ticket()
+        ticket.from_asn1(tgs['ticket'])
 
-                apReq = AP_REQ()
-                apReq['pvno'] = 5
-                apReq['msg-type'] = int(constants.ApplicationTagNumbers.AP_REQ.value)
+        apReq = AP_REQ()
+        apReq['pvno'] = 5
+        apReq['msg-type'] = int(constants.ApplicationTagNumbers.AP_REQ.value)
 
-                opts = [2]
-                apReq['ap-options'] = constants.encodeFlags(opts)
-                seq_set(apReq, 'ticket', ticket.to_asn1)
+        opts = [2]
+        apReq['ap-options'] = constants.encodeFlags(opts)
+        seq_set(apReq, 'ticket', ticket.to_asn1)
 
-                authenticator = Authenticator()
-                authenticator['authenticator-vno'] = 5
-                authenticator['crealm'] = domain
-                seq_set(authenticator, 'cname', user.components_to_asn1)
-                now = datetime.datetime.utcnow()
+        authenticator = Authenticator()
+        authenticator['authenticator-vno'] = 5
+        authenticator['crealm'] = domain
+        seq_set(authenticator, 'cname', user.components_to_asn1)
+        now = datetime.datetime.utcnow()
 
-                authenticator['cusec'] = now.microsecond
-                authenticator['ctime'] = KerberosTime.to_asn1(now)
-                encodedAuthenticator = encoder.encode(authenticator)
-                encryptedEncodedAuthenticator = cipher.encrypt(sessionKey, 11, encodedAuthenticator, None)
+        authenticator['cusec'] = now.microsecond
+        authenticator['ctime'] = KerberosTime.to_asn1(now)
+        encodedAuthenticator = encoder.encode(authenticator)
+        encryptedEncodedAuthenticator = cipher.encrypt(sessionKey, 11, encodedAuthenticator, None)
 
-                apReq['authenticator'] = noValue
-                apReq['authenticator']['etype'] = cipher.enctype
-                apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
+        apReq['authenticator'] = noValue
+        apReq['authenticator']['etype'] = cipher.enctype
+        apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
 
-                blob['MechToken'] = encoder.encode(apReq)
-                authenticate = base64.b64encode(blob.getData())
-                self.auth = authenticate
+        blob['MechToken'] = encoder.encode(apReq)
+        authenticate = base64.b64encode(blob.getData())
+        self.auth = authenticate
 
     def check_auth(self, http_response: List[Union[h11.Response, h11.Data]]) -> Union[None, bytes]:
         """Given an HTTP response, will generate a corresponding NTLM authentication HTTP
@@ -353,70 +353,72 @@ class ProxyToServerHelper(ConnectionHandler):
         if self.auth is None:
             raise RuntimeError("Did not prepare auth first.")
 
-        # Parsing HTTP headers
+        # Parsing HTTP headers to retrive WWW-Authenticate headers
         headers = http_response[0].headers
-        www_authenticate = []
+        www_authenticate = []  # List of WWW-Authenticate headers' values
         for header in headers:
             if header[0] == b"www-authenticate":
                 www_authenticate.append(header[1].decode())
         if len(www_authenticate) == 0:
-            # There is nothing to do
+            # No WWW-Authenticate header, there is nothing to do
             return None
 
         if not any(val.startswith("NTLM") or val.startswith("Negotiate") for val in www_authenticate):
-            # Not NTLM authentication
+            # Not NTLM nor kerberos authentication
             return None
 
-        if www_authenticate[0].startswith("Negotiate oYGh"):
-            return None
-            
-        if www_authenticate[0].startswith("NTLM") and len(www_authenticate[0]) > 5:
-            # If NTLMSSP_CHALLENGE, should be the only one WWW_AUTHENTICATE header returned by the server
-            # NTLMSSP_CHALLENGE message
-            # Sending NTLMSSP_AUTH message
-            self.logger.debug("Got NTLM CHALLENGE.")
-            return b"NTLM " + base64.b64encode(
-                self.auth.step(
-                    base64.b64decode(www_authenticate[0][5:])
+        use_ntlm = False
+        use_kerberos = False
+        token = None
+        for header_val in www_authenticate:
+            if header_val.startswith("NTLM") and not self.is_kerberos:
+                use_ntlm = True
+                prepend = b"NTLM "
+                token = header_val[5:]
+                break  # This is the default for NTLM
+            elif header_val.startswith("Negotiate") and not self.is_kerberos:
+                use_ntlm = True
+                prepend = b"Negotiate "
+                token = header_val[10:]
+            elif header_val.startswith("Negotiate"):
+                use_kerberos = True
+                prepend = b"Negotiate "
+                token = header_val[10:]
+                break  # This is the default for Kerberos
+
+        if use_ntlm:
+            if len(token) == 0:
+                # First 401 from server
+                # Sending NTLM_NEGOTIATE
+                try:
+                    return prepend + base64.b64encode(self.auth.step(None))  #TODO
+                except TypeError:
+                    # This is the second time we received a NTLM NEGOTIATE message
+                    # meaning that the authentication failed. We just forward the response
+                    # to the client
+                    self.logger.warning("Authentication failed.")
+                    raise RuntimeError("Authentication failed.")
+            elif token.startswith("YIG"):
+                # This is a Negotiate:Kerberos response
+                self.logger.warning("Remote server only accepts Kerberos authentication, consider using -k option.")
+                raise RuntimeError("Authentication failed.")
+            else:
+                # Got CHALLENGE message from server
+                # Sending NTLM_AUTH
+                self.logger.debug("Got NTLM CHALLENGE from %s", prepend.decode().strip())
+                return prepend + base64.b64encode(  #TODO
+                    self.auth.step(
+                        base64.b64decode(token)
+                    )
                 )
-            )
+        elif use_kerberos:
+            if token.startswith("oYGh"):
+                # Response to final kerberos message, nothing to do
+                #TODO: analyse the response to check for errors
+                return None
 
-        if www_authenticate[0].startswith('Negotiate TlRMT'):
-             self.logger.debug("Got NTLM CHALLENGE from Negotiate")
-             # Detecting NTLMSSP_CHALLENGE from a Negotiate Header
-             # Sending NTLMSSP_AUTH message
-             return b"Negotiate " + base64.b64encode(
-                     self.auth.step(
-                         base64.b64decode(www_authenticate[0][10:])
-                         )
-                     )
-
-        if www_authenticate[0].startswith('Negotiate YIG') and not self.is_kerberos:
-            # Remote server only accept Negotiate:Kerberos
-            self.logger.warning("Remore server only accept Kerberos authentication, consider using -k option.")
-            raise RuntimeError("Authentication failed.")
-
-
-        # Initial 401 unauthorized request
-        # Sending NTLMSSP_NEGOTIATE message
-        self.logger.debug("Got NTLM NEGOTIATE.")
-        if any([value.startswith("NTLM") for value in www_authenticate]):
-            # We received a WWW-AUTHENTICATE: NTLM header
-            prepend = b"NTLM "
-        else:
-            prepend = b"NEGOTIATE "
-        try:
-            if self.is_kerberos: #perform Kerberos Authentication
-                return b"Negotiate " + self.auth 
-
-            else: # perform NTLM
-                return prepend + base64.b64encode(self.auth.step(None))
-        except TypeError:
-            # This is the second time we received a NTLM NEGOTIATE message
-            # meaning that the authentication failed. We just forward the response
-            # to the client
-            self.logger.warning("Authentication failed.")
-            raise RuntimeError("Authentication failed.")
+            # Simply include the kerberos AP_REQ
+            return prepend + self.auth
 
     def send(self, events: List[Union[h11.Response, h11.Data, h11.EndOfMessage]]) -> None:
         """Sending request to remote server."""
@@ -627,7 +629,7 @@ class Proxy:
 
         self.is_kerberos = is_kerberos # Will perform kerberos authentication if available
         self.kdcHost = dcip # ip address of the KDC for kerberos authentication
-       
+
     def __enter__(self):
         self.logger.debug("Entered proxy, creating sockets.")
         self.prx_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
@@ -705,9 +707,9 @@ class Proxy:
 
          domain: typing.Optional[str]
          if '\\' in username:
-              domain, username = username.split('\\', 1)
+             domain, username = username.split('\\', 1)
          else:
-              domain = None
+             domain = None
 
          return to_text(domain, nonstring='passthru'), to_text(username, nonstring='passthru')
 
