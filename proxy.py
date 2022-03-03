@@ -15,12 +15,14 @@ import select
 import ipaddress
 import h11
 import typing
-from typing import Union, Tuple, List
+import calendar
+import struct
+import signal
+import sys
+from textwrap import indent
+from typing import Union, Tuple, List, Dict
 from time import sleep
-
-# Manage NTLM authentification
-import spnego
-from spnego._text import to_text
+from binascii import a2b_hex
 
 # Multiprocessing
 from multiprocessing import Process
@@ -42,11 +44,15 @@ from h11 import LocalProtocolError, RemoteProtocolError
 
 #Manage Kerberos
 
-from impacket.spnego import ASN1_AID, SPNEGO_NegTokenInit, TypesMech
+from impacket.spnego import ASN1_AID, SPNEGO_NegTokenInit, SPNEGO_NegTokenResp, TypesMech
 from impacket.krb5.asn1 import AP_REQ, Authenticator, TGS_REP, seq_set
 from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS
 from impacket.krb5.types import Principal, KerberosTime, Ticket
+from impacket.krb5.ccache import CCache
+from impacket.krb5.kerberosv5 import KerberosError
 from impacket.krb5 import constants
+from impacket.ntlm import getNTLMSSPType1, getNTLMSSPType3
+from impacket import ntlm
 from pyasn1.codec.ber import encoder, decoder
 from pyasn1.type.univ import noValue
 
@@ -185,11 +191,17 @@ class ConnectionHandler:
         if self.conn.our_state is h11.SEND_RESPONSE:
             # We should be sending a response but there has been an error
             response = h11.Response(status_code=500, reason=b"Internal error", headers=[(b"Connection", b"close")])
-            self._send([response, h11.EndOfMessage()])
+            try:
+                self._send([response, h11.EndOfMessage()])
+            except BrokenPipeError:
+                pass
 
         data = self.conn.send(h11.ConnectionClosed())
         if data is not None:
-            self.curr_sock.sendall(data)
+            try:
+                self.curr_sock.sendall(data)
+            except BrokenPipeError:
+                pass
 
         try:
             self.curr_sock.shutdown(socket.SHUT_RDWR)
@@ -199,7 +211,7 @@ class ConnectionHandler:
 
     def _send(self, events: List[Union[h11.Request, h11.Response, h11.InformationalResponse, h11.Data, h11.EndOfMessage, h11.ConnectionClosed]]):
         for event in events:
-            self.logger.debug("Sending %s", event)
+            self.logger.debug("Sending %s", pretty(event))
             data = self.conn.send(event)
             if data is not None:
                 self.curr_sock.sendall(data)
@@ -229,8 +241,76 @@ class ConnectionHandler:
 
             if type(event) is h11.EndOfMessage:
                 # Everything is fetched
-                self.logger.debug(f"Received {events}")
+                self.logger.debug("Received %s", pretty(events))
                 return events
+
+
+def pretty(
+        events: Union[
+            Union[
+                h11.Request,
+                h11.Response,
+                h11.InformationalResponse,
+                h11.Data,
+                h11.EndOfMessage,
+                h11.ConnectionClosed
+            ],
+            List[Union[
+                h11.Request,
+                h11.Response,
+                h11.InformationalResponse,
+                h11.Data,
+                h11.EndOfMessage,
+                h11.ConnectionClosed
+            ]]
+        ]
+) -> str:
+    if type(events) != list:
+        events = [events]
+
+    res = ""
+    for event in events:
+        if type(event) == h11.Request:
+            res += f"\n\n{event.method.decode()} {event.target.decode()} HTTP/{event.http_version.decode()}"
+            for header, val in event.headers:
+                res += f"\n{header.decode()}: {val.decode()}"
+            res += "\n"
+        elif type(event) in [h11.InformationalResponse, h11.Response]:
+            res += f"\n\nHTTP/{event.http_version.decode()} {event.status_code} {event.reason.decode()}"
+            for header, val in event.headers:
+                res += f"\n{header.decode()}: {val.decode()}"
+            res += "\n"
+        elif type(event) == h11.Data:
+            res += f"DATA: \n\n{event.data.decode(errors='ignore')}\n"
+        elif type(event) == h11.EndOfMessage:
+            res += f"END with headers:"
+            for header, val in event.headers:
+                res += f"\n{header.decode(errors='ignore')}: {val.decode(errors='ignore')}"
+        elif type(event) == h11.ConnectionClosed:
+            res += "Connection closed"
+        else:
+            res += f"\n\n{str(res)}\n"
+        return indent(res, "\t")
+
+def to_text(obj, encoding='utf-8', errors='strict', nonstring='str'):
+    if isinstance(obj, str):
+        return obj
+    elif isinstance(obj, bytes):
+        return obj.decode(encoding, errors)
+
+    if nonstring == 'str':
+        try:
+            obj = obj.__unicode__()
+        except (AttributeError, UnicodeError):
+            obj = _obj_str(obj, "")
+
+        return to_text(obj, errors=errors, encoding=encoding)
+    elif nonstring == 'passthru':
+        return obj
+    elif nonstring == 'empty':
+        return ''
+    else:
+        raise ValueError("Invalid nonstring value '%s', expecting repr, passthru, or empty" % nonstring)
 
 
 class ProxyToServerHelper(ConnectionHandler):
@@ -238,17 +318,21 @@ class ProxyToServerHelper(ConnectionHandler):
     Connect to remote socket with TLS.
     """
 
-    def __init__(self, use_tls: bool, hostname: str, port: int, is_kerberos):
+    def __init__(self, use_tls: bool, hostname: str, port: int, use_kerberos):
         super().__init__()
 
-        self.logger = logging.getLogger("Proxy.ProxyToServerHelper")
+        self.logger = logging.getLogger("Proxy.Proxy<->Server")
 
         self.conn = h11.Connection(our_role=h11.CLIENT)
 
         self.use_tls = use_tls  # Should the connection be on top of TLS
 
-        self.auth = None
-        self.is_kerberos = is_kerberos
+        self.ntlm_auth = {
+            "negotiate": None,
+            "challenge": None,
+            "auth": None
+        }
+        self.use_kerberos = use_kerberos
 
         # Remote hostname & port
         self.hostname = hostname
@@ -258,6 +342,7 @@ class ProxyToServerHelper(ConnectionHandler):
 
         self.logger.debug("Creating socket & connecting")
         self.sock = socket.create_connection((self.hostname, self.port), timeout=5)
+
         self.curr_sock = self.sock
         # PROTOCOL_TLS_CLIENT requires valid cert chain and hostname
         if self.use_tls:
@@ -281,37 +366,82 @@ class ProxyToServerHelper(ConnectionHandler):
             srv_cert = self._dump_server_cert()
             # Generating channel binding stuff
             cbt = get_channel_bindings_from_cert(srv_cert)
-            channel_bindings = spnego.channel_bindings.GssChannelBindings(
-                application_data=cbt
-            )
             self.logger.debug("Channel binding token %s.", cbt)
         except RuntimeError:
             # Could not generate channel binding token -> leaving it empty
-            channel_bindings = None
+            return None
 
-        return channel_bindings
+        token_len = len(cbt)
+        writer = b"\x00"*16
+        writer += struct.pack('I', token_len)
+        digest = hashes.Hash(hashes.MD5(), default_backend())
+        digest.update(writer)
+        digest.update(cbt)
+        return digest.finalize()
 
-    def init_auth(self, username, password):
-        channel_bindings = self.get_channel_bindings()
-        self.auth = spnego.client(
-            username=username,
-            password=password,
-            #hostname="toto",
-            hostname=self.hostname,
-            service="HSJK",
-            protocol="ntlm",
-            channel_bindings=channel_bindings,
-        )
+    def kerberos_auth(self, domain, username, password, kdc_host, useCache=True):
 
-    def kerberos_auth(self,domain,username,password,kdcHost):
+        TGS = None
+        if useCache is True :
+            try:
+                ccache = CCache.loadFile(os.getenv('KRB5CCNAME'))
+            except:
+                self.logger.warning("No cache present, using provided credential")
+                user = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+                tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(user, password, domain, "", "", "", kdc_host)
+                spn = self.hostname.split("." + domain)[0]
+ 
+            else:
+                self.logger.warning("Using Kerberos Cache")
+                # retrieve domain information from CCache file if needed
+                domain = ccache.principal.realm['data'].decode('utf-8')
+                self.logger.debug('Domain retrieved from CCache: %s' % domain)
 
-        user = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
-        tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(user, password, domain,"" ,"","",kdcHost)
-        spn = self.hostname.replace("."+domain,"")
-        serverName = Principal('HTTP/'+spn, type=constants.PrincipalNameType.NT_SRV_INST.value)
-        tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(serverName,domain ,kdcHost , tgt, cipher,sessionKey)
+                spn = self.hostname.replace("." + domain, "")
+                principal = 'http/%s@%s' % (spn.upper(),domain.upper())
+                creds = ccache.getCredential(principal)
+                if creds is None:
+                    principal = 'krbtgt/%s@%s' % (domain.upper(),domain.upper())
+                    creds =  ccache.getCredential(principal)
+                    if creds is not None:
+                        TGT = creds.toTGT()
+                        tgt = TGT['KDC_REP']
+                        cipher = TGT['cipher']
+                        sessionKey = TGT['sessionKey']
+                        self.logger.warning('Using TGT from cache')
+                    else:
+                        self.logger.debug("No valid credentials found in cache. ")
+                        pass
+                else:
+                    TGS = creds.toTGS()
+                    self.logger.debug('Using TGS from cache')
+
+
+                # retrieve user information from CCache file if needed
+                if creds is not None:
+                    user = creds['client'].prettyPrint().split(b'@')[0].decode('utf-8')
+                    self.logger.debug('Username retrieved from CCache: %s' % user)
+                    user = Principal(user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+                elif len(ccache.principal.components) > 0:
+                    user = ccache.principal.components[0]['data'].decode('utf-8')
+                    user = Principal(user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+                    self.logger.debug('Username retrieved from CCache: %s' % user)
+
+
+        
+        
+        if TGS is None :
+           serverName = Principal('HTTP/' + spn, type=constants.PrincipalNameType.NT_SRV_INST.value)
+           tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(serverName, domain, kdc_host, tgt, cipher, sessionKey)
+        else:
+           tgs = TGS['KDC_REP']
+           sessionKey = TGS['sessionKey']
+           cipher = TGS['cipher']
+
+
+
         blob = SPNEGO_NegTokenInit()
-        blob['MechTypes'] = [TypesMech['MS KRB5 - Microsoft Kerberos 5'],TypesMech['KRB5 - Kerberos 5'],TypesMech['NEGOEX - SPNEGO Extended Negotiation Security Mechanism'],TypesMech['NTLMSSP - Microsoft NTLM Security Support Provider']]
+        blob['MechTypes'] = [TypesMech['MS KRB5 - Microsoft Kerberos 5'], TypesMech['KRB5 - Kerberos 5'], TypesMech['NEGOEX - SPNEGO Extended Negotiation Security Mechanism'], TypesMech['NTLMSSP - Microsoft NTLM Security Support Provider']]
 
 
         tgs = decoder.decode(tgs, asn1Spec=TGS_REP())[0]
@@ -342,28 +472,77 @@ class ProxyToServerHelper(ConnectionHandler):
         apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
 
         blob['MechToken'] = encoder.encode(apReq)
-        authenticate = base64.b64encode(blob.getData())
-        self.auth = authenticate
+        return base64.b64encode(blob.getData())
 
-    def check_auth(self, http_response: List[Union[h11.Response, h11.Data]]) -> Union[None, bytes]:
+    def gen_ntlm_negotiate(self) -> bytes:
+        """Returns a NEGOTIATE_MESSAGE base64 encoded message."""
+
+        negotiate = getNTLMSSPType1(workstation="", domain="", signingRequired=True)
+        #negotiate["flags"] = ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY | ntlm.NTLMSSP_NEGOTIATE_ALWAYS_SIGN | ntlm.NTLMSSP_NEGOTIATE_NTLM | ntlm.NTLM_NEGOTIATE_OEM | ntlm.NTLMSSP_REQUEST_TARGET | ntlm.NTLMSSP_NEGOTIATE_UNICODE
+
+        # Saving this message
+        self.ntlm_auth["negotiate"] = negotiate
+
+        return base64.b64encode(negotiate.getData())
+
+    def gen_ntlm_auth(self, creds, lmhash, nthash) -> bytes:
+        """Returns an AUTHENTICATE_MESSAGE from the previous messages."""
+
+        def myComputeResponseNTLMv2(flags, serverChallenge, clientChallenge, serverName, domain, user, password, lmhash='', nthash='', use_ntlmv2=ntlm.USE_NTLMv2):
+            """Rewriten method to override the default Impacket one as it does
+            not allow to specify the correct target name (always "cifs/..."),
+            nor permit to add the channel bindings value.
+            Has to be defined dynamically to include the current value of
+            channel bindings."""
+        
+            responseServerVersion = b'\x01'
+            hiResponseServerVersion = b'\x01'
+            responseKeyNT = ntlm.NTOWFv2(user, password, domain, nthash)
+        
+            av_pairs = ntlm.AV_PAIRS(serverName)
+            av_pairs[ntlm.NTLMSSP_AV_TARGET_NAME] = 'http/'.encode('utf-16le') + av_pairs[ntlm.NTLMSSP_AV_HOSTNAME][1]
+            channel_bindings = self.get_channel_bindings()
+            if channel_bindings is not None:
+                av_pairs[ntlm.NTLMSSP_AV_CHANNEL_BINDINGS] = channel_bindings
+            if av_pairs[ntlm.NTLMSSP_AV_TIME] is not None:
+               aTime = av_pairs[ntlm.NTLMSSP_AV_TIME][1]
+            else:
+               aTime = struct.pack('<q', (116444736000000000 + calendar.timegm(time.gmtime()) * 10000000) )
+               av_pairs[ntlm.NTLMSSP_AV_TIME] = aTime
+            serverName = av_pairs.getData()
+        
+            temp = responseServerVersion + hiResponseServerVersion + b'\x00' * 6 + aTime + clientChallenge + b'\x00' * 4 + \
+                   serverName + b'\x00' * 4
+        
+            ntProofStr = ntlm.hmac_md5(responseKeyNT, serverChallenge + temp)
+        
+            ntChallengeResponse = ntProofStr + temp
+            lmChallengeResponse = ntlm.hmac_md5(responseKeyNT, serverChallenge + clientChallenge) + clientChallenge
+            sessionBaseKey = ntlm.hmac_md5(responseKeyNT, ntProofStr)
+        
+            return ntChallengeResponse, lmChallengeResponse, sessionBaseKey
+
+        # Overriding the impacket default method
+        ntlm.computeResponseNTLMv2 = myComputeResponseNTLMv2
+        auth, exported_session_key = getNTLMSSPType3(self.ntlm_auth["negotiate"], self.ntlm_auth["challenge"], creds["username"], creds["password"] , creds["domain"], lmhash, nthash)
+        return base64.b64encode(auth.getData())
+
+    def check_auth(self, http_response: List[Union[h11.Response, h11.Data]], creds: Dict[str, str], lmhash, nthash) -> Union[None, bytes]:
         """Given an HTTP response, will generate a corresponding NTLM authentication HTTP
         header value or will return None. May raise RuntimeException in case there is a problem.
         """
-
-        if self.auth is None:
-            raise RuntimeError("Did not prepare auth first.")
 
         # Parsing HTTP headers to retrive WWW-Authenticate headers
         headers = http_response[0].headers
         www_authenticate = []  # List of WWW-Authenticate headers' values
         for header in headers:
             if header[0] == b"www-authenticate":
-                www_authenticate.append(header[1].decode())
+                www_authenticate.append(header[1])
         if len(www_authenticate) == 0:
             # No WWW-Authenticate header, there is nothing to do
             return None
 
-        if not any(val.startswith("NTLM") or val.startswith("Negotiate") for val in www_authenticate):
+        if not any(val.startswith(b"NTLM") or val.startswith(b"Negotiate") for val in www_authenticate):
             # Not NTLM nor kerberos authentication
             return None
 
@@ -371,16 +550,16 @@ class ProxyToServerHelper(ConnectionHandler):
         use_kerberos = False
         token = None
         for header_val in www_authenticate:
-            if header_val.startswith("NTLM") and not self.is_kerberos:
+            if header_val.startswith(b"NTLM") and not self.use_kerberos:
                 use_ntlm = True
                 prepend = b"NTLM "
                 token = header_val[5:]
                 break  # This is the default for NTLM
-            elif header_val.startswith("Negotiate") and not self.is_kerberos:
+            elif header_val.startswith(b"Negotiate") and not self.use_kerberos:
                 use_ntlm = True
                 prepend = b"Negotiate "
                 token = header_val[10:]
-            elif header_val.startswith("Negotiate"):
+            elif header_val.startswith(b"Negotiate"):
                 use_kerberos = True
                 prepend = b"Negotiate "
                 token = header_val[10:]
@@ -391,14 +570,15 @@ class ProxyToServerHelper(ConnectionHandler):
                 # First 401 from server
                 # Sending NTLM_NEGOTIATE
                 try:
-                    return prepend + base64.b64encode(self.auth.step(None))  #TODO
+                    new_token = self.gen_ntlm_negotiate()
+                    return prepend + new_token
                 except TypeError:
                     # This is the second time we received a NTLM NEGOTIATE message
                     # meaning that the authentication failed. We just forward the response
                     # to the client
                     self.logger.warning("Authentication failed.")
                     raise RuntimeError("Authentication failed.")
-            elif token.startswith("YIG"):
+            elif token.startswith(b"YIG"):
                 # This is a Negotiate:Kerberos response
                 self.logger.warning("Remote server only accepts Kerberos authentication, consider using -k option.")
                 raise RuntimeError("Authentication failed.")
@@ -406,29 +586,27 @@ class ProxyToServerHelper(ConnectionHandler):
                 # Got CHALLENGE message from server
                 # Sending NTLM_AUTH
                 self.logger.debug("Got NTLM CHALLENGE from %s", prepend.decode().strip())
-                return prepend + base64.b64encode(  #TODO
-                    self.auth.step(
-                        base64.b64decode(token)
-                    )
-                )
+                self.ntlm_auth["challenge"] = base64.b64decode(token)
+                new_token = self.gen_ntlm_auth(creds,lmhash,nthash)
+                return prepend + new_token
         elif use_kerberos:
-            if token.startswith("oYGh"):
+            if token.startswith(b"oYGh"):
                 # Response to final kerberos message, nothing to do
                 #TODO: analyse the response to check for errors
                 return None
 
             # Simply include the kerberos AP_REQ
-            return prepend + self.auth
+            return prepend + self.kerberos_auth(creds["domain"], creds["username"], creds["password"], creds["kdc_host"])
 
     def send(self, events: List[Union[h11.Response, h11.Data, h11.EndOfMessage]]) -> None:
         """Sending request to remote server."""
 
-        self.logger.debug(f"Our state: {self.conn.our_state}; their state: {self.conn.their_state}")
+        self.logger.debug("Our state: %s; their state: %s", self.conn.our_state, self.conn.their_state)
         assert self.conn.our_state is h11.IDLE and self.conn.their_state is h11.IDLE
 
         if not self.use_tls:
             # Modifying the request from "GET http://google.fr/test HTTP/1.1" to "GET /test HTTP/1.1"
-            self.logger.debug(f"Modifying {events[0]}")
+            self.logger.debug("Modifying %s", pretty(events[0]))
             path = urlparse(events[0].target).path
             events[0].target = path
 
@@ -437,10 +615,14 @@ class ProxyToServerHelper(ConnectionHandler):
     def recv(self) -> List[Union[h11.Response, h11.Data, h11.EndOfMessage]]:
         """Receiving server response."""
 
-        self.logger.debug(f"Our state: {self.conn.our_state}; their state: {self.conn.their_state}")
+        self.logger.debug("Our state: %s; their state: %s", self.conn.our_state, self.conn.their_state)
         assert self.conn.our_state in [h11.DONE, h11.MUST_CLOSE, h11.CLOSED] and self.conn.their_state is h11.SEND_RESPONSE
 
-        received = self._recv()
+        try:
+            received = self._recv()
+        except ssl.SSLError:
+            self.logger.error(e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
+            self.stop()
 
         if self.conn.our_state is h11.MUST_CLOSE or self.conn.their_state is h11.MUST_CLOSE:
             self.stop()
@@ -456,7 +638,7 @@ class ClientToProxyHelper(ConnectionHandler):
     def __init__(self, sock, cert_manager):
         super().__init__()
 
-        self.logger = logging.getLogger("Proxy.ClientToProxyHelper")
+        self.logger = logging.getLogger("Proxy.Client<->ProxyHelper")
 
         self.logger.debug("Creating new ClientToProxyHelper")
 
@@ -496,7 +678,7 @@ class ClientToProxyHelper(ConnectionHandler):
     def send(self, events: List[Union[h11.Response, h11.Data, h11.EndOfMessage]]):
         """Send response to client."""
 
-        self.logger.debug(f"Our state: {self.conn.our_state}; their state: {self.conn.their_state}")
+        self.logger.debug("Our state: %s; their state: %s", self.conn.our_state, self.conn.their_state)
         assert self.conn.our_state is h11.SEND_RESPONSE and self.conn.their_state in [h11.DONE, h11.MIGHT_SWITCH_PROTOCOL, h11.MUST_CLOSE]
 
         self._send(events)
@@ -507,7 +689,7 @@ class ClientToProxyHelper(ConnectionHandler):
     def recv(self) -> List[Union[h11.Request, h11.Data, h11.EndOfMessage]]:
         """Receiving server response."""
 
-        self.logger.debug(f"Our state: {self.conn.our_state}; their state: {self.conn.their_state}")
+        self.logger.debug("Our state: %s; their state: %s", self.conn.our_state, self.conn.their_state)
         assert self.conn.our_state is h11.IDLE and self.conn.their_state is h11.IDLE
 
         return self._recv()
@@ -534,10 +716,7 @@ class ClientToProxyHelper(ConnectionHandler):
 
         self.logger.debug("Wrapping initial client to proxy socket")
 
-        try:
-            self.ssock = self.context.wrap_socket(sock=self.sock, server_side=True)
-        except ssl.SSLError as e:
-            raise RuntimeError("Cannot wrap socket") from e
+        self.ssock = self.context.wrap_socket(sock=self.sock, server_side=True)
 
         self.curr_sock = self.ssock
         self.logger.debug("Wrapped")
@@ -613,8 +792,10 @@ class Proxy:
     Listens on a local port for SSL connections.
     """
 
-    def __init__(self, listen_address: str, listen_port: int, cert_manager: CertManager, dcip: str="", is_kerberos: bool = False, is_multiprocess: bool = False, creds: dict = None):
+    def __init__(self, listen_address: str, listen_port: int, cert_manager: CertManager, dcip: str="", lmhash: str="", nthash: str="", use_kerberos: bool = False, is_multiprocess: bool = False, creds: dict = None):
         self.logger = logging.getLogger("Proxy")
+
+        signal.signal(signal.SIGINT, self.interrupted)
 
         self.prx_sock = None  # Proxy socket that waits for client connections
 
@@ -626,9 +807,19 @@ class Proxy:
         self.is_multiprocess = is_multiprocess  # Will the program run in multiple processes
 
         self.creds = creds  # List of credentials
-
-        self.is_kerberos = is_kerberos # Will perform kerberos authentication if available
-        self.kdcHost = dcip # ip address of the KDC for kerberos authentication
+        self.lmhash = '' 
+        self.nthash = ''
+        
+        if lmhash != '' or nthash != '':
+            if len(lmhash) % 2:     lmhash = '0%s' % lmhash
+            if len(nthash) % 2:     nthash = '0%s' % nthash
+            try: # just in case they were converted already
+                self.lmhash = a2b_hex(lmhash)
+                self.nthash = a2b_hex(nthash)
+            except:
+                pass
+        self.use_kerberos = use_kerberos # Will perform kerberos authentication if available
+        self.kdc_host = dcip # ip address of the KDC for kerberos authentication
 
     def __enter__(self):
         self.logger.debug("Entered proxy, creating sockets.")
@@ -668,6 +859,10 @@ class Proxy:
             reason=resp.reason
         )
 
+    def interrupted(self, signal, frame):
+        self.logger.info("Stopping proxy")
+        sys.exit(0)
+
     def run(self) -> None:
         """Starts the proxy."""
 
@@ -701,19 +896,17 @@ class Proxy:
         self.logger.debug("Using user %s with password %s for %s.", username, password, srv_host)
         return username, password
     
-    def  split_username(self,username: typing.Optional[str]) -> typing.Tuple[typing.Optional[str], typing.Optional[str]]:
-         if username is None:
-              return None, None
+    def split_username(self, username: typing.Optional[str]) -> typing.Tuple[typing.Optional[str], typing.Optional[str]]:
+        if username is None:
+            return None, None
 
-         domain: typing.Optional[str]
-         if '\\' in username:
-             domain, username = username.split('\\', 1)
-         else:
-             domain = None
+        domain: typing.Optional[str]
+        if '\\' in username:
+            domain, username = username.split('\\', 1)
+        else:
+            domain = None
 
-         return to_text(domain, nonstring='passthru'), to_text(username, nonstring='passthru')
-
-
+        return to_text(domain, nonstring='passthru'), to_text(username, nonstring='passthru')
 
     def handle_connection(self, clt2prx_con: socket.socket) -> None:
         """Handle a client connection to the proxy."""
@@ -729,13 +922,18 @@ class Proxy:
         # Establish TLS if needed (between client and proxy)
         try:
             srv_host, srv_port = clt2prx_hdler.prepare(clt_events)
+        except ssl.SSLError as e:
+            self.logger.error("SSL Error: %s", e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
+            clt2prx_hdler.stop()
+            return
         except Exception as e:
-            self.logger.error(e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
+            self.logger.error("Unknown error: %s", e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
+            clt2prx_hdler.stop()
             return
 
         try:
             # Create handler to manage connection between proxy and server
-            prx2srv_hdler = ProxyToServerHelper(clt2prx_hdler.use_tls, srv_host, srv_port, self.is_kerberos)
+            prx2srv_hdler = ProxyToServerHelper(clt2prx_hdler.use_tls, srv_host, srv_port, self.use_kerberos)
         except (TimeoutError, socket.timeout):
             self.logger.warning("Request to %s:%s timed out.", srv_host, srv_port)
             clt2prx_hdler.stop()
@@ -746,7 +944,15 @@ class Proxy:
             clt2prx_hdler.stop()
             return
         except OSError as e:
-            self.logger.warning(f"Error while connected to remote server: {e}")
+            self.logger.error("Error while connecting to remote server: %s", e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
+            clt2prx_hdler.stop()
+            return
+        except ssl.SSLError as e:
+            self.logger.error("SSL error while connecting to remote server: %s", e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
+            clt2prx_hdler.stop()
+            return
+        except Exception as e:
+            self.logger.error("Unknown error: %s", e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
             clt2prx_hdler.stop()
             return
 
@@ -764,12 +970,15 @@ class Proxy:
 
         # Current status of NTLM authentication for this proxy2server connection (may not be used)
         username, password = self._get_creds(srv_host)
+        domain, username = self.split_username(username)
 
-        if self.is_kerberos :
-            domain, username = self.split_username(username)
-            prx2srv_hdler.kerberos_auth(domain,username,password, self.kdcHost)
-        else:
-            prx2srv_hdler.init_auth(username, password)
+        # Prepare credential object
+        cur_creds = {
+            "username": username,
+            "password": password,
+            "domain": domain,
+            "kdc_host": self.kdc_host
+        }
 
         last_loop = False
         while True:
@@ -800,7 +1009,7 @@ class Proxy:
 
                 # Check if there is an Authentication header, and generates the corresponding header if so
                 try:
-                    authorization_header = prx2srv_hdler.check_auth(srv_resp)
+                    authorization_header = prx2srv_hdler.check_auth(srv_resp, cur_creds, self.lmhash, self.nthash)
                 except RuntimeError:
                     self.logger.warning("Error while performing authentication, stopping.")
                     prx2srv_hdler.stop()
@@ -824,7 +1033,6 @@ class Proxy:
             srv_resp[0] = self._force_http_version(srv_resp[0])
             # Sending the server response back to the client
             clt2prx_hdler.send(srv_resp)
-            print(clt2prx_hdler.conn.states)
             if clt2prx_hdler.conn.our_state is h11.CLOSED or clt2prx_hdler.conn.their_state is h11.CLOSED:
                 last_loop = True
 
@@ -858,9 +1066,6 @@ def main():
                         help="Address the proxy will be listening on, defaults to 127.0.0.1.")
     parser.add_argument("--listen-port", "-p", default=3128, type=int,
                         help="Port the proxy will be listening on, defaults to 3128.")
-
-    
-
 
     # CA options
     parser.add_argument("--cacert", default="./cacert.pem",
@@ -902,13 +1107,12 @@ def main():
                         help="Default username to use. In the form domain\\\\user.")
     parser.add_argument("--default_password", "-dp", default="password",
                         help="Default password to use.")
-
-    
+    parser.add_argument("--hashes", help="could be used instead of default_password. format: lmhash:nthash")
 
     # Kerberos authentication options
     parser.add_argument("--kerberos", "-k", action="store_true", help="Enable kerberos authentication instead of NTLM")
     parser.add_argument('--dcip', action='store',  help="IP Address of the domain controller (only for kerberos)")
-    
+
 
     args = parser.parse_args()
 
@@ -936,7 +1140,12 @@ def main():
             "password": args.default_password
         }
     })
-    with Proxy(args.listen_address, args.listen_port, cert_manager, args.dcip, is_kerberos=args.kerberos, is_multiprocess=not args.singleprocess, creds=credentials) as proxy:
+    lmhash = ""
+    nthash = ""
+    if args.hashes is not None:
+        lmhash, nthash = args.hashes.split(':')
+
+    with Proxy(args.listen_address, args.listen_port, cert_manager, args.dcip, lmhash, nthash, use_kerberos=args.kerberos, is_multiprocess=not args.singleprocess, creds=credentials) as proxy:
         proxy.run()
 
 
