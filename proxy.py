@@ -748,7 +748,10 @@ class ClientToProxyHelper(ConnectionHandler):
                 # This is an IP address, we need to find the hostname associated
                 # 2 possibilities: from the SNI in the TLS session ; from the Host header
                 try:
-                    self.remote_host = request.headers["Host"].decode()
+                    for header,value in request.headers:
+                        if header.decode().lower() == "host":
+                            self.remote_host = value.decode().split(":")[0]
+                            break
                 except ValueError:
                     # No header host, we will need to rely on the SNI
                     pass
