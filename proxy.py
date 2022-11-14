@@ -769,9 +769,12 @@ class ClientToProxyHelper(ConnectionHandler):
 
             # Response in plaintext HTTP
             connect_response = h11.Response(status_code=200, headers=[])
-            self.send([connect_response])  # No EndOfMessage here as h11 thinks its job is done here, protocol is
-            # switched to something else (because we answered 200 to a CONNECT request). Therefore we need to create a
-            # new conn to follow the inner HTTP exchange
+            try:
+                self.send([connect_response])  # No EndOfMessage here as h11 thinks its job is done here, protocol is
+                # switched to something else (because we answered 200 to a CONNECT request). Therefore we need to create a
+                # new conn to follow the inner HTTP exchange
+            except BrokenPipeError as e:
+                raise RuntimeError("Error while sending 200 OK response during client connection to the proxy") from e
             self.conn = h11.Connection(our_role=h11.SERVER)
 
             # Wrapping in TLS session (MitM), hopping that the client is looking
@@ -997,7 +1000,12 @@ class Proxy:
             init_req = clt_events[0]
             while True:
                 # Perform authentication
-                prx2srv_hdler.send(clt_events)
+                try:
+                    prx2srv_hdler.send(clt_events)
+                except BrokenPipeError:
+                    self.logger.warning("Server closed connection while sending packets to it.")
+                    return
+
                 try:
                     srv_resp = prx2srv_hdler.recv()
                 except (LocalProtocolError, RemoteProtocolError, socket.timeout):
@@ -1035,7 +1043,12 @@ class Proxy:
             # if it is not 1.1. Hopefully it will be compatible...
             srv_resp[0] = self._force_http_version(srv_resp[0])
             # Sending the server response back to the client
-            clt2prx_hdler.send(srv_resp)
+            try:
+                clt2prx_hdler.send(srv_resp)
+            except BrokenPipeError as e:
+                self.logger.warning("Could not send the response to the client.")
+                return
+
             if clt2prx_hdler.conn.our_state is h11.CLOSED or clt2prx_hdler.conn.their_state is h11.CLOSED:
                 last_loop = True
 
