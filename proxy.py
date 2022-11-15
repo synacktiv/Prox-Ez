@@ -141,6 +141,7 @@ class CertManager:
         cert.set_serial_number(random.randint(50000000,100000000))
         subject = cert.get_subject()
         subject.commonName = common_name
+        cert.add_extensions([crypto.X509Extension(b"subjectAltName", False, f"DNS:{common_name}".encode())])
         cert.set_issuer(self.cacert.get_subject())
         cert.set_pubkey(key)
         cert.gmtime_adj_notBefore(0)
