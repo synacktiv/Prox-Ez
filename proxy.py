@@ -390,7 +390,11 @@ class ProxyToServerHelper(ConnectionHandler):
             except:
                 self.logger.warning("No cache present, using provided credential")
                 user = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
-                tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(user, password, domain, "", "", "", kdc_host)
+                try:
+                    tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(user, password, domain, "", "", "", kdc_host)
+                except KerberosError as e:
+                    self.logger.error(f"Cannot get TGT: {e}")
+                    raise RuntimeError
                 spn = self.hostname.split("." + domain)[0]
  
             else:
@@ -434,7 +438,11 @@ class ProxyToServerHelper(ConnectionHandler):
         
         if TGS is None :
            serverName = Principal('HTTP/' + spn, type=constants.PrincipalNameType.NT_SRV_INST.value)
-           tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(serverName, domain, kdc_host, tgt, cipher, sessionKey)
+           try:
+               tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(serverName, domain, kdc_host, tgt, cipher, sessionKey)
+           except KerberosError as e:
+               self.logger.error(f"Cannot get TGS: {e}")
+               raise RuntimeError
         else:
            tgs = TGS['KDC_REP']
            sessionKey = TGS['sessionKey']
