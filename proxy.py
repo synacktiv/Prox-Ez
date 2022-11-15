@@ -282,7 +282,8 @@ def pretty(
                 res += f"\n{header.decode()}: {val.decode()}"
             res += "\n"
         elif type(event) == h11.Data:
-            res += f"DATA: \n\n{event.data.decode(errors='ignore')}\n"
+            #res += f"DATA: \n\n{event.data.decode(errors='ignore')}\n"
+            res += f"DATA"
         elif type(event) == h11.EndOfMessage:
             res += f"END with headers:"
             for header, val in event.headers:
