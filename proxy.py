@@ -22,7 +22,7 @@ import sys
 from textwrap import indent
 from typing import Union, Tuple, List, Dict
 from time import sleep
-from binascii import a2b_hex
+from binascii import unhexlify
 
 # Multiprocessing
 from multiprocessing import Process
@@ -495,7 +495,7 @@ class ProxyToServerHelper(ConnectionHandler):
 
         return base64.b64encode(negotiate.getData())
 
-    def gen_ntlm_auth(self, creds, lmhash, nthash) -> bytes:
+    def gen_ntlm_auth(self, creds) -> bytes:
         """Returns an AUTHENTICATE_MESSAGE from the previous messages."""
 
         def myComputeResponseNTLMv2(flags, serverChallenge, clientChallenge, serverName, domain, user, password, lmhash='', nthash='', use_ntlmv2=ntlm.USE_NTLMv2):
@@ -534,10 +534,10 @@ class ProxyToServerHelper(ConnectionHandler):
 
         # Overriding the impacket default method
         ntlm.computeResponseNTLMv2 = myComputeResponseNTLMv2
-        auth, exported_session_key = getNTLMSSPType3(self.ntlm_auth["negotiate"], self.ntlm_auth["challenge"], creds["username"], creds["password"] , creds["domain"], lmhash, nthash)
+        auth, exported_session_key = getNTLMSSPType3(self.ntlm_auth["negotiate"], self.ntlm_auth["challenge"], creds["username"], creds["password"] , creds["domain"], creds["lmhash"], creds["nthash"])
         return base64.b64encode(auth.getData())
 
-    def check_auth(self, http_response: List[Union[h11.Response, h11.Data]], creds: Dict[str, str], lmhash, nthash) -> Union[None, bytes]:
+    def check_auth(self, http_response: List[Union[h11.Response, h11.Data]], creds: Dict[str, str]) -> Union[None, bytes]:
         """Given an HTTP response, will generate a corresponding NTLM authentication HTTP
         header value or will return None. May raise RuntimeException in case there is a problem.
         """
@@ -597,7 +597,7 @@ class ProxyToServerHelper(ConnectionHandler):
                 # Sending NTLM_AUTH
                 self.logger.debug("Got NTLM CHALLENGE from %s", prepend.decode().strip())
                 self.ntlm_auth["challenge"] = base64.b64decode(token)
-                new_token = self.gen_ntlm_auth(creds,lmhash,nthash)
+                new_token = self.gen_ntlm_auth(creds)
                 return prepend + new_token
         elif use_kerberos:
             if token.startswith(b"oYGh"):
@@ -808,7 +808,7 @@ class Proxy:
     Listens on a local port for SSL connections.
     """
 
-    def __init__(self, listen_address: str, listen_port: int, cert_manager: CertManager, dcip: str="", lmhash: str="", nthash: str="", use_kerberos: bool = False, is_multiprocess: bool = False, creds: dict = None):
+    def __init__(self, listen_address: str, listen_port: int, cert_manager: CertManager, dcip: str="", use_kerberos: bool = False, is_multiprocess: bool = False, creds: dict = None):
         self.logger = logging.getLogger("Proxy")
 
         signal.signal(signal.SIGINT, self.interrupted)
@@ -823,17 +823,21 @@ class Proxy:
         self.is_multiprocess = is_multiprocess  # Will the program run in multiple processes
 
         self.creds = creds  # List of credentials
-        self.lmhash = '' 
-        self.nthash = ''
+        for hostname, cred in creds.items():
+            if "hashes" in cred:
+                try:
+                    lmhash, nthash = cred["hashes"].split(":", 1)
+
+                    if len(lmhash) % 2:     lmhash = '0%s' % lmhash
+                    if len(nthash) % 2:     nthash = '0%s' % nthash
+
+                    cred["lmhash"] = unhexlify(lmhash)
+                    cred["nthash"] = unhexlify(nthash)
+                except Exception:
+                    # We will not use the hash
+                    self.logger.warning(f"Hash for {hostname if hostname != '_' else 'default website'} as {cred['creds'].split(':')[0]} is not valid")
+                    del cred["hashes"]
         
-        if lmhash != '' or nthash != '':
-            if len(lmhash) % 2:     lmhash = '0%s' % lmhash
-            if len(nthash) % 2:     nthash = '0%s' % nthash
-            try: # just in case they were converted already
-                self.lmhash = a2b_hex(lmhash)
-                self.nthash = a2b_hex(nthash)
-            except:
-                pass
         self.use_kerberos = use_kerberos # Will perform kerberos authentication if available
         self.kdc_host = dcip # ip address of the KDC for kerberos authentication
 
@@ -875,6 +879,17 @@ class Proxy:
             reason=resp.reason
         )
 
+    def _stop_handling(self):
+        try:
+            self.clt2prx_hdler.stop()
+        except Exception:
+            pass
+
+        try:
+            self.prx2srv_hdler.stop()
+        except Exception:
+            pass
+
     def interrupted(self, signal, frame):
         self.logger.info("Stopping proxy")
         sys.exit(0)
@@ -903,14 +918,32 @@ class Proxy:
                     return
 
     def _get_creds(self, srv_host):
-        _ = "_"
+        h = "_"
+        domain, username, password, nthash, lmhash = None, None, None, None, None
+
         if srv_host in self.creds:
             self.logger.debug("Got credentials for %s.", srv_host)
-            _ = srv_host
-        username = self.creds[_]["username"]
-        password = self.creds[_]["password"]
-        self.logger.debug("Using user %s with password %s for %s.", username, password, srv_host)
-        return username, password
+            h = srv_host
+
+        domain, user_and_pass = self.creds[h]["creds"].split("/", 1)
+
+        splitted = user_and_pass.split(":", 1)
+        if len(splitted) == 2:
+            username = splitted[0]
+            password = splitted[1]
+
+        elif "hashes" not in self.creds[h]:
+            # len == 1 -> no password, need hash
+            raise RuntimeError(f"No password nor hash for {srv_host}")
+
+        else:
+            # We have the username and the hash
+            username = splitted[0]
+            lmhash = self.creds[h]["lmhash"]
+            nthash = self.creds[h]["nthash"]
+
+        self.logger.debug("Using user %s with password %s or hashes %s:%s for %s.", username, password, lmhash, nthash, srv_host)
+        return domain, username, password, lmhash, nthash
     
     def split_username(self, username: typing.Optional[str]) -> typing.Tuple[typing.Optional[str], typing.Optional[str]]:
         if username is None:
@@ -933,6 +966,7 @@ class Proxy:
             clt_events = clt2prx_hdler.recv()
         except (LocalProtocolError, RemoteProtocolError):
             self.logger.warning("Wrong initial request received from client")
+            self._stop_handling()
             return
 
         # Establish TLS if needed (between client and proxy)
@@ -940,11 +974,11 @@ class Proxy:
             srv_host, srv_port = clt2prx_hdler.prepare(clt_events)
         except ssl.SSLError as e:
             self.logger.error("SSL Error: %s", e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
-            clt2prx_hdler.stop()
+            self._stop_handling()
             return
         except Exception as e:
             self.logger.error("Unknown error: %s", e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
-            clt2prx_hdler.stop()
+            self._stop_handling()
             return
 
         try:
@@ -952,24 +986,24 @@ class Proxy:
             prx2srv_hdler = ProxyToServerHelper(clt2prx_hdler.use_tls, srv_host, srv_port, self.use_kerberos)
         except (TimeoutError, socket.timeout):
             self.logger.warning("Request to %s:%s timed out.", srv_host, srv_port)
-            clt2prx_hdler.stop()
+            self._stop_handling()
             return
         except ConnectionRefusedError:
             self.logger.warning("Request could not be performed to %s:%s: connection refused.",
                                 srv_host, srv_port)
-            clt2prx_hdler.stop()
+            self._stop_handling()
             return
         except OSError as e:
             self.logger.error("Error while connecting to remote server: %s", e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
-            clt2prx_hdler.stop()
+            self._stop_handling()
             return
         except ssl.SSLError as e:
             self.logger.error("SSL error while connecting to remote server: %s", e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
-            clt2prx_hdler.stop()
+            self._stop_handling()
             return
         except Exception as e:
             self.logger.error("Unknown error: %s", e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
-            clt2prx_hdler.stop()
+            self._stop_handling()
             return
 
         if clt2prx_hdler.use_tls:
@@ -982,17 +1016,24 @@ class Proxy:
                 self.logger.warning(
                     "The client did not send a correct second request after the initial CONNECT request."
                 )
+                self._stop_handling()
                 return
 
         # Current status of NTLM authentication for this proxy2server connection (may not be used)
-        username, password = self._get_creds(srv_host)
-        domain, username = self.split_username(username)
+        try:
+            domain, username, password, lmhash, nthash = self._get_creds(srv_host)
+        except Exception as e:
+            self.logger.error(f"Improper credentials for {srv_host}: %s", e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
+            self._stop_handling()
+            return
 
         # Prepare credential object
         cur_creds = {
+            "domain": domain,
             "username": username,
             "password": password,
-            "domain": domain,
+            "lmhash": lmhash if lmhash is not None else "",
+            "nthash": nthash if nthash is not None else "",
             "kdc_host": self.kdc_host
         }
 
@@ -1014,26 +1055,28 @@ class Proxy:
                     prx2srv_hdler.send(clt_events)
                 except BrokenPipeError:
                     self.logger.warning("Server closed connection while sending packets to it.")
+                    self._stop_handling()
                     return
 
                 try:
                     srv_resp = prx2srv_hdler.recv()
                 except (LocalProtocolError, RemoteProtocolError, socket.timeout):
                     self.logger.warning("Server did not respond correctly to proxy request.")
+                    self._stop_handling()
                     return
 
                 if prx2srv_hdler.conn.our_state is h11.CLOSED or prx2srv_hdler.conn.their_state is h11.CLOSED:
                     # No use to perform authentication (TCP connection is closed), just forward response
-                    prx2srv_hdler.stop()
+                    self._stop_handling()
                     last_loop = True
                     break
 
                 # Check if there is an Authentication header, and generates the corresponding header if so
                 try:
-                    authorization_header = prx2srv_hdler.check_auth(srv_resp, cur_creds, self.lmhash, self.nthash)
+                    authorization_header = prx2srv_hdler.check_auth(srv_resp, cur_creds)
                 except RuntimeError:
                     self.logger.warning("Error while performing authentication, stopping.")
-                    prx2srv_hdler.stop()
+                    self._stop_handling()
                     last_loop = True
                     break
                 if authorization_header is None:
@@ -1041,7 +1084,7 @@ class Proxy:
                     try:
                         prx2srv_hdler.conn.start_next_cycle()
                     except LocalProtocolError:
-                        prx2srv_hdler.stop()
+                        self._stop_handling()
                         last_loop = True
                     break
 
@@ -1057,6 +1100,7 @@ class Proxy:
                 clt2prx_hdler.send(srv_resp)
             except BrokenPipeError as e:
                 self.logger.warning("Could not send the response to the client.")
+                self._stop_handling()
                 return
 
             if clt2prx_hdler.conn.our_state is h11.CLOSED or clt2prx_hdler.conn.their_state is h11.CLOSED:
@@ -1073,10 +1117,10 @@ class Proxy:
             except (LocalProtocolError, RemoteProtocolError):
                 # Client closed connection
                 self.logger.info("Client did not send correct HTTP request.")
+                self._stop_handling()
                 break
 
-        clt2prx_hdler.stop()
-        prx2srv_hdler.stop()
+        self._stop_handling()
 
 
 def main():
@@ -1121,19 +1165,17 @@ def main():
                         help="""Path to the credentials file, for instance:
 {
     "my.hostname.com": {
-        "username": "domain\\user",
-        "password": "password"
-    }, "my.second.hostname.com": {
-        "username": "domain1\\user1",
-        "password": "password1"
+        "creds": "domain/user:password",
+    },
+    "my.second.hostname.com": {
+        "creds": "domain1/user1",
+        "hashes": ":nthash1"
     }
 }
 """)
-    parser.add_argument("--default_username", "-du", default="user",
-                        help="Default username to use. In the form domain\\\\user.")
-    parser.add_argument("--default_password", "-dp", default="password",
-                        help="Default password to use.")
-    parser.add_argument("--hashes", help="could be used instead of default_password. format: lmhash:nthash")
+    parser.add_argument("--default_creds", "-dc", default="./user:password",
+                        help="Default credentials that will be used to authenticate.")
+    parser.add_argument("--hashes", help="Could be used instead of password. It is associated with the domain and username given via --default_creds. format: lmhash:nthash or :nthash")
 
     # Kerberos authentication options
     parser.add_argument("--kerberos", "-k", action="store_true", help="Enable kerberos authentication instead of NTLM")
@@ -1157,21 +1199,19 @@ def main():
     # Loading credentials from file if provided
     credentials = {}
     if args.creds is not None:
-        with open(args.creds, "r") as creds_file:
-            credentials = json.load(creds_file)
+        try:
+            with open(args.creds, "r") as creds_file:
+                credentials = json.load(creds_file)
+        except Exception as e:
+            print("Error reading credential file:", e)
+            exit(1)
     # Default credentials (arbitrarily associated with hostname "_")
-    credentials.update({
-        "_": {
-            "username": args.default_username,
-            "password": args.default_password
-        }
-    })
-    lmhash = ""
-    nthash = ""
     if args.hashes is not None:
-        lmhash, nthash = args.hashes.split(':')
+        credentials.update({"_": {"creds": args.default_creds, "hashes": args.hashes}})
+    else:
+        credentials.update({"_": {"creds": args.default_creds}})
 
-    with Proxy(args.listen_address, args.listen_port, cert_manager, args.dcip, lmhash, nthash, use_kerberos=args.kerberos, is_multiprocess=not args.singleprocess, creds=credentials) as proxy:
+    with Proxy(args.listen_address, args.listen_port, cert_manager, args.dcip, use_kerberos=args.kerberos, is_multiprocess=not args.singleprocess, creds=credentials) as proxy:
         proxy.run()
 
 
