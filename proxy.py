@@ -22,7 +22,7 @@ import sys
 from textwrap import indent
 from typing import Union, Tuple, List, Dict
 from time import sleep
-from binascii import unhexlify
+from binascii import unhexlify, hexlify
 
 # Multiprocessing
 from multiprocessing import Process
@@ -381,17 +381,21 @@ class ProxyToServerHelper(ConnectionHandler):
         digest.update(cbt)
         return digest.finalize()
 
-    def kerberos_auth(self, domain, username, password, kdc_host, useCache=True):
+    def kerberos_auth(self, domain, username, password, kdc_host, lmhash, nthash, useCache=True):
 
         TGS = None
         if useCache is True :
             try:
                 ccache = CCache.loadFile(os.getenv('KRB5CCNAME'))
+                if ccache is None:
+                 raise RuntimeError
             except:
                 self.logger.warning("No cache present, using provided credential")
                 user = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
                 try:
-                    tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(user, password, domain, "", "", "", kdc_host)
+                    lmhash = hexlify(lmhash.encode())
+                    nthash = hexlify(nthash.encode())
+                    tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(user, password, domain,lmhash , nthash, "", kdc_host)
                 except KerberosError as e:
                     self.logger.error(f"Cannot get TGT: {e}")
                     raise RuntimeError
@@ -606,7 +610,7 @@ class ProxyToServerHelper(ConnectionHandler):
                 return None
 
             # Simply include the kerberos AP_REQ
-            return prepend + self.kerberos_auth(creds["domain"], creds["username"], creds["password"], creds["kdc_host"])
+            return prepend + self.kerberos_auth(creds["domain"], creds["username"], creds["password"], creds["lmhash"], creds["nthash"], creds["kdc_host"])
 
     def send(self, events: List[Union[h11.Response, h11.Data, h11.EndOfMessage]]) -> None:
         """Sending request to remote server."""
