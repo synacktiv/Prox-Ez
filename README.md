@@ -17,9 +17,13 @@ $ python3 -m pip install -r requirements.txt
 
 ### Quickstart
 
-Run like that, it will try to authenticate with the credentials `default_user:default_password`:
+Run like that, it will try to authenticate with the credentials `mydomain/myusername:mypassword` on any website that requires authentication:
 ```
 python3 proxy.py -dc mydomain/myusername:mypassword
+```
+
+Same but using NT hash instead of password:
+```
 python3 proxy.py -dc mydomain/myusername --hashes :31d6cfe0d16ae931b73c59d7e0c089c0
 ```
 
