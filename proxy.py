@@ -388,9 +388,11 @@ class ProxyToServerHelper(ConnectionHandler):
             try:
                 ccache = CCache.loadFile(os.getenv('KRB5CCNAME'))
                 if ccache is None:
-                 raise RuntimeError
+                    # Depending on the Impacket version, sometime CCache.loadFile returns None or
+                    # raises an exception.
+                    raise RuntimeError("Cannot load ccache file.")
             except:
-                self.logger.warning("No cache present, using provided credential")
+                self.logger.warning("No ccache present, or invalid, using provided credentials")
                 user = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
                 try:
                     tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(user, password, domain, lmhash, nthash, "", kdc_host)
@@ -400,15 +402,25 @@ class ProxyToServerHelper(ConnectionHandler):
                 spn = self.hostname.split("." + domain)[0]
  
             else:
-                self.logger.warning("Using Kerberos Cache")
+                self.logger.warning("Using kerberos ccache")
                 # retrieve domain information from CCache file if needed
                 domain = ccache.principal.realm['data'].decode('utf-8')
-                self.logger.debug('Domain retrieved from CCache: %s' % domain)
+                self.logger.debug('Domain retrieved from ccache: %s' % domain)
 
                 spn = self.hostname.replace("." + domain, "")
+                try:
+                    # Warn in case the host is an IP address which is weird with kerberos
+                    ipaddress.ip_address(spn)
+                except ValueError:
+                    # Expected behavior
+                    pass
+                else:
+                    self.logger.warning("Be careful, the provided host is an IP address, and you try to use it with Kerberos.")
                 principal = 'http/%s@%s' % (spn.upper(),domain.upper())
+                self.logger.debug("Principal name built from provided information: %s", principal)
                 creds = ccache.getCredential(principal)
                 if creds is None:
+                    # CCache provided is a TGT
                     principal = 'krbtgt/%s@%s' % (domain.upper(),domain.upper())
                     creds =  ccache.getCredential(principal)
                     if creds is not None:
@@ -418,9 +430,9 @@ class ProxyToServerHelper(ConnectionHandler):
                         sessionKey = TGT['sessionKey']
                         self.logger.warning('Using TGT from cache')
                     else:
-                        self.logger.debug("No valid credentials found in cache. ")
-                        pass
+                        raise RuntimeError("Credentials in cache not for target hostname. Cannot continue.")
                 else:
+                    # CCache provided is a TGS
                     TGS = creds.toTGS()
                     self.logger.debug('Using TGS from cache')
 
@@ -428,12 +440,12 @@ class ProxyToServerHelper(ConnectionHandler):
                 # retrieve user information from CCache file if needed
                 if creds is not None:
                     user = creds['client'].prettyPrint().split(b'@')[0].decode('utf-8')
-                    self.logger.debug('Username retrieved from CCache: %s' % user)
+                    self.logger.debug('Username retrieved from ccache: %s' % user)
                     user = Principal(user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
                 elif len(ccache.principal.components) > 0:
                     user = ccache.principal.components[0]['data'].decode('utf-8')
                     user = Principal(user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
-                    self.logger.debug('Username retrieved from CCache: %s' % user)
+                    self.logger.debug('Username retrieved from ccache: %s' % user)
 
 
         
@@ -1077,8 +1089,8 @@ class Proxy:
                 # Check if there is an Authentication header, and generates the corresponding header if so
                 try:
                     authorization_header = prx2srv_hdler.check_auth(srv_resp, cur_creds)
-                except RuntimeError:
-                    self.logger.warning("Error while performing authentication, stopping.")
+                except RuntimeError as e:
+                    self.logger.error("Error while performing authentication, stopping. Error details: %s", e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
                     self._stop_handling()
                     last_loop = True
                     break
