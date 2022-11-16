@@ -22,7 +22,7 @@ import sys
 from textwrap import indent
 from typing import Union, Tuple, List, Dict
 from time import sleep
-from binascii import unhexlify, hexlify
+from binascii import unhexlify
 
 # Multiprocessing
 from multiprocessing import Process
@@ -381,7 +381,7 @@ class ProxyToServerHelper(ConnectionHandler):
         digest.update(cbt)
         return digest.finalize()
 
-    def kerberos_auth(self, domain, username, password, kdc_host, lmhash, nthash, useCache=True):
+    def kerberos_auth(self, domain, username, password, lmhash, nthash, kdc_host, useCache=True):
 
         TGS = None
         if useCache is True :
@@ -393,9 +393,7 @@ class ProxyToServerHelper(ConnectionHandler):
                 self.logger.warning("No cache present, using provided credential")
                 user = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
                 try:
-                    lmhash = hexlify(lmhash.encode())
-                    nthash = hexlify(nthash.encode())
-                    tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(user, password, domain,lmhash , nthash, "", kdc_host)
+                    tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(user, password, domain, lmhash, nthash, "", kdc_host)
                 except KerberosError as e:
                     self.logger.error(f"Cannot get TGT: {e}")
                     raise RuntimeError
