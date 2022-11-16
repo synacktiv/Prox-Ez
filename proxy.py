@@ -489,6 +489,12 @@ class ProxyToServerHelper(ConnectionHandler):
     def gen_ntlm_negotiate(self) -> bytes:
         """Returns a NEGOTIATE_MESSAGE base64 encoded message."""
 
+        if self.ntlm_auth["negotiate"] is not None:
+            # This is the second time we build a NTLM NEGOTIATE message
+            # meaning that the authentication failed. We just forward the response
+            # to the client
+            raise RuntimeError("Authentication failed, probably bad credentials or server does not support NTLM.")
+
         negotiate = getNTLMSSPType1(workstation="", domain="", signingRequired=True)
         #negotiate["flags"] = ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY | ntlm.NTLMSSP_NEGOTIATE_ALWAYS_SIGN | ntlm.NTLMSSP_NEGOTIATE_NTLM | ntlm.NTLM_NEGOTIATE_OEM | ntlm.NTLMSSP_REQUEST_TARGET | ntlm.NTLMSSP_NEGOTIATE_UNICODE
 
@@ -581,19 +587,11 @@ class ProxyToServerHelper(ConnectionHandler):
             if len(token) == 0:
                 # First 401 from server
                 # Sending NTLM_NEGOTIATE
-                try:
-                    new_token = self.gen_ntlm_negotiate()
-                    return prepend + new_token
-                except TypeError:
-                    # This is the second time we received a NTLM NEGOTIATE message
-                    # meaning that the authentication failed. We just forward the response
-                    # to the client
-                    self.logger.warning("Authentication failed.")
-                    raise RuntimeError("Authentication failed.")
+                new_token = self.gen_ntlm_negotiate()
+                return prepend + new_token
             elif token.startswith(b"YIG"):
                 # This is a Negotiate:Kerberos response
-                self.logger.warning("Remote server only accepts Kerberos authentication, consider using -k option.")
-                raise RuntimeError("Authentication failed.")
+                raise RuntimeError("Remote server only accepts Kerberos authentication, consider using -k option.")
             else:
                 # Got CHALLENGE message from server
                 # Sending NTLM_AUTH
@@ -668,7 +666,7 @@ class ClientToProxyHelper(ConnectionHandler):
         self.context = None
 
     def _setup_context(self, _: ssl.SSLSocket, server_name: str, context: ssl.SSLContext):
-        """Will be call when the client has sent the client hello handshake message.
+        """Will be called when the client has sent the client hello handshake message.
         In that case, we are able to check the SNI and update the context.
         """
         if server_name is None:
