@@ -678,7 +678,10 @@ class ClientToProxyHelper(ConnectionHandler):
         # We can now generate the correct certificate
         cert_path, key_path = self.cert_manager.generate(self.remote_host)
 
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS)
+        if hasattr(ssl, "PROTOCOL_TLS_SERVER"):
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        elif hasattr(ssl, "PROTOCOL_TLS"):
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS)
         context.load_cert_chain(
             certfile=cert_path,
             keyfile=key_path,
