@@ -616,6 +616,9 @@ class ProxyToServerHelper(ConnectionHandler):
                 # Response to final kerberos message, nothing to do
                 #TODO: analyse the response to check for errors
                 return None
+            elif len(token) != 0:
+                # An error occured with the AP_REQ we sent
+                raise RuntimeError("The server responded with an error to our Kerberos authentication. See debug mode for the returned message. You can use analyze_message.sh to analyze it in Wireshark.")
 
             # Simply include the kerberos AP_REQ
             return prepend + self.kerberos_auth(creds["domain"], creds["username"], creds["password"], creds["lmhash"], creds["nthash"], creds["kdc_host"])
