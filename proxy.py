@@ -349,6 +349,7 @@ class ProxyToServerHelper(ConnectionHandler):
         # PROTOCOL_TLS_CLIENT requires valid cert chain and hostname
         if self.use_tls:
             self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            self.context.keylog_filename = SSL_KEYS_DUMP_FILE
             # Do not verify remote server certificate, may change in the future
             self.context.check_hostname = False
             self.context.verify_mode = ssl.CERT_NONE
@@ -781,6 +782,7 @@ class ClientToProxyHelper(ConnectionHandler):
             raise RuntimeError("Socket already wrapped.")
 
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLS)
+        self.context.keylog_filename = SSL_KEYS_DUMP_FILE
 
         if self.remote_host is None:
             self.context.sni_callback(self._setup_context)
@@ -1243,6 +1245,9 @@ def main():
     # Debug
     parser.add_argument("--debug", "-d", action="store_true",
                         help="Increase debug output.")
+    parser.add_argument("--dump-keys", "-dk", action="store",
+                        help="File to dump the SSL/TLS keys to. Useful when trying to debug.\
+                        When this option is specified, --singleprocess is implied.")
 
     # Credentials options
     parser.add_argument("--creds",
@@ -1279,6 +1284,12 @@ def main():
     if args.debug:
         logging.getLogger("Proxy").setLevel(logging.DEBUG)
 
+    global SSL_KEYS_DUMP_FILE
+    SSL_KEYS_DUMP_FILE = None
+    if args.dump_keys:
+        args.singleprocess = True
+        SSL_KEYS_DUMP_FILE = args.dump_keys
+
     # Handling parameters
     if not os.path.isdir(args.certsdir):
         os.mkdir(args.certsdir)
@@ -1304,7 +1315,17 @@ def main():
     if args.spn is not None:
         credentials["_"]["spn"] = args.spn
 
-    with Proxy(args.listen_address, args.listen_port, cert_manager, args.dcip, use_kerberos=args.kerberos, is_multiprocess=not args.singleprocess, creds=credentials, spn_force_fqdn=args.spn_force_fqdn, epa=args.epa) as proxy:
+    with Proxy(
+            args.listen_address,
+            args.listen_port,
+            cert_manager,
+            args.dcip,
+            use_kerberos=args.kerberos,
+            is_multiprocess=not args.singleprocess,
+            creds=credentials,
+            spn_force_fqdn=args.spn_force_fqdn,
+            epa=args.epa
+    ) as proxy:
         proxy.run()
 
 

@@ -43,10 +43,8 @@ You may also need to disable the socks proxy if enabled.
 
 ```
 $ python3 proxy.py -h
-usage: proxy.py [-h] [--listen-address LISTEN_ADDRESS] [--listen-port LISTEN_PORT] [--cacert CACERT] [--cakey CAKEY]
-                [--cakey-pass CAKEY_PASS] [--certsdir CERTSDIR] [--singleprocess] [--debug] [--creds CREDS]
-                [--default-creds DEFAULT_CREDS] [--hashes HASHES] [--kerberos] [--dcip DCIP] [--spn SPN]
-                [--spn-force-fqdn] [--no-epa]
+usage: proxy.py [-h] [--listen-address LISTEN_ADDRESS] [--listen-port LISTEN_PORT] [--cacert CACERT] [--cakey CAKEY] [--cakey-pass CAKEY_PASS] [--certsdir CERTSDIR] [--singleprocess] [--debug] [--dump-keys DUMP_KEYS] [--creds CREDS]
+                [--default-creds DEFAULT_CREDS] [--hashes HASHES] [--kerberos] [--dcip DCIP] [--spn SPN] [--spn-force-fqdn] [--no-epa]
 
 Prox-Ez: The Swiss Army Knife of HTTP auth.
 
@@ -56,23 +54,19 @@ optional arguments:
                         Address the proxy will be listening on, defaults to 127.0.0.1.
   --listen-port LISTEN_PORT, -p LISTEN_PORT
                         Port the proxy will be listening on, defaults to 3128.
-  --cacert CACERT       Filepath to the CA certificate, defaults to ./cacert.pem. Will be created if it does not
-                        exists.
-  --cakey CAKEY         Filepath to the CA private key, defaults to ./cakey.pem. Will be created if it does not
-                        exists.
+  --cacert CACERT       Filepath to the CA certificate, defaults to ./cacert.pem. Will be created if it does not exists.
+  --cakey CAKEY         Filepath to the CA private key, defaults to ./cakey.pem. Will be created if it does not exists.
   --cakey-pass CAKEY_PASS
                         CA private key passphrase.
-  --certsdir CERTSDIR   Path to the directory the generated certificates will be stored in, defaults to /tmp/Prox-Ez.
-                        Will be created if it does not exists.
+  --certsdir CERTSDIR   Path to the directory the generated certificates will be stored in, defaults to /tmp/Prox-Ez. Will be created if it does not exists.
   --singleprocess, -sp  Do you want to be slowwwww ?! Actually useful during debug.
   --debug, -d           Increase debug output.
-  --creds CREDS         Path to the credentials file, for instance: { "my.hostname.com": { "creds":
-                        "domain/user:password", "spn": "HTTP/anothername" }, "my.second.hostname.com": { "creds":
-                        "domain1/user1", "hashes": ":nthash1" } }
+  --dump-keys DUMP_KEYS, -dk DUMP_KEYS
+                        File to dump the SSL/TLS keys to. Useful when trying to debug. When this option is specified, --singleprocess is implied.
+  --creds CREDS         Path to the credentials file, for instance: { "my.hostname.com": { "creds": "domain/user:password", "spn": "HTTP/anothername" }, "my.second.hostname.com": { "creds": "domain1/user1", "hashes": ":nthash1" } }
   --default-creds DEFAULT_CREDS, -dc DEFAULT_CREDS
                         Default credentials that will be used to authenticate.
-  --hashes HASHES       Could be used instead of password. It is associated with the domain and username given via
-                        --default_creds. format: lmhash:nthash or :nthash.
+  --hashes HASHES       Could be used instead of password. It is associated with the domain and username given via --default_creds. format: lmhash:nthash or :nthash.
   --kerberos, -k        Enable kerberos authentication instead of NTLM.
   --dcip DCIP           IP Address of the domain controller (only for kerberos).
   --spn SPN             Use the provided SPN when an SPN is needed. More details in the article.
