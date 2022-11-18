@@ -312,7 +312,7 @@ def to_text(obj, encoding='utf-8', errors='strict', nonstring='str'):
     elif nonstring == 'empty':
         return ''
     else:
-        raise ValueError("Invalid nonstring value '%s', expecting repr, passthru, or empty" % nonstring)
+        raise ValueError("Invalid nonstring value '%s', expecting repr, passthru, or empty." % nonstring)
 
 
 class ProxyToServerHelper(ConnectionHandler):
@@ -360,7 +360,7 @@ class ProxyToServerHelper(ConnectionHandler):
         """Returns the certificate of the remote server as DER format (as bytes)."""
         if self.use_tls:
             return self.ssock.getpeercert(binary_form=True)
-        raise RuntimeError("Tried to dump remote server certificate in a non-TLS session")
+        raise RuntimeError("Tried to dump remote server certificate in a non-TLS session.")
 
     def get_channel_bindings(self):
         try:
@@ -381,9 +381,32 @@ class ProxyToServerHelper(ConnectionHandler):
         digest.update(cbt)
         return digest.finalize()
 
-    def kerberos_auth(self, domain, username, password, lmhash, nthash, kdc_host, useCache=True):
-
+    def kerberos_auth(self, user_creds, useCache=True):
+        """Build an AP_REQ from the credentials provided or the KRB5CCNAME ccache ticket."""
         TGS = None
+
+        # Building target SPN name
+        if user_creds["spn"] is not None:
+            # User wants a specific SPN
+            spn_target_name = user_creds["spn"]
+            if "@" not in spn_target_name:
+                spn_target_name += "@" + user_creds["spn"].split(".", 1)[-1]
+        else:
+            # We have to build the SPN ourselves
+            target_domain = ""
+            if "." not in user_creds["target"]:
+                # Short name, not FQDN, using user's domain
+                self.logger.warning("Short name used to access the service (not a FQDN), using the domain associated with the user to look for TGS in ccache, ie. %s. Use --spn to overwrite.", user_creds["domain"])
+                target_domain = user_creds["domain"]
+            else:
+                # Extracting the domain from the target
+                target_domain = user_creds["target"].split(".", 1)[-1]
+
+            # Actually build SPN name
+            spn_target_name = 'http/%s@%s' % (user_creds["target"], target_domain)
+
+        self.logger.debug("Target principal name built from provided information: %s", spn_target_name)
+
         if useCache is True :
             try:
                 ccache = CCache.loadFile(os.getenv('KRB5CCNAME'))
@@ -392,49 +415,58 @@ class ProxyToServerHelper(ConnectionHandler):
                     # raises an exception.
                     raise RuntimeError("Cannot load ccache file.")
             except:
-                self.logger.warning("No ccache present, or invalid, using provided credentials")
-                user = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+                # No CCache, or invalid, therefore getting TGT
+                self.logger.warning("No ccache, or invalid, using provided credentials")
+                user = Principal(user_creds["username"], type=constants.PrincipalNameType.NT_PRINCIPAL.value)
                 try:
-                    tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(user, password, domain, lmhash, nthash, "", kdc_host)
+                    tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(user, user_creds["password"], user_creds["domain"], user_creds["lmhash"], user_creds["nthash"], "", user_creds["kdc_host"])
                 except KerberosError as e:
+                    # Cannot get TGT, exiting
                     self.logger.error(f"Cannot get TGT: {e}")
                     raise RuntimeError
-                spn = self.hostname.split("." + domain)[0]
  
             else:
+                # We were able to load the CCache, we need to check if it is a TGT or TGS
                 self.logger.warning("Using kerberos ccache")
-                # retrieve domain information from CCache file if needed
-                domain = ccache.principal.realm['data'].decode('utf-8')
-                self.logger.debug('Domain retrieved from ccache: %s' % domain)
 
-                spn = self.hostname.replace("." + domain, "")
+                # Retrieve domain information from CCache file if needed
+                domain_from_ccache = ccache.principal.realm['data'].decode('utf-8')
+                self.logger.debug('Domain retrieved from ccache: %s', domain_from_ccache)
+
                 try:
                     # Warn in case the host is an IP address which is weird with kerberos
-                    ipaddress.ip_address(spn)
+                    if user_creds["spn"] is None:
+                        ipaddress.ip_address(user_creds["target"])
+                    else:
+                        ipaddress.ip_address(user_creds["spn"].split("/", 1)[-1].split("@", 1)[0])
                 except ValueError:
                     # Expected behavior
                     pass
                 else:
+                    # Not blocking in case the user tries some crazy shit
                     self.logger.warning("Be careful, the provided host is an IP address, and you try to use it with Kerberos.")
-                principal = 'http/%s@%s' % (spn.upper(),domain.upper())
-                self.logger.debug("Principal name built from provided information: %s", principal)
-                creds = ccache.getCredential(principal)
+
+                # Trying to get secrets associated with the destination SPN
+                creds = ccache.getCredential(spn_target_name)
                 if creds is None:
-                    # CCache provided is a TGT
-                    principal = 'krbtgt/%s@%s' % (domain.upper(),domain.upper())
-                    creds =  ccache.getCredential(principal)
+                    # CCache provided is probably a TGT (no creds for the destination SPN)
+                    spn_kdc_name = 'krbtgt/%s@%s' % (domain_from_ccache.upper(), domain_from_ccache.upper())
+                    creds =  ccache.getCredential(spn_kdc_name)
                     if creds is not None:
+                        # It is indeed a TGT
                         TGT = creds.toTGT()
                         tgt = TGT['KDC_REP']
                         cipher = TGT['cipher']
                         sessionKey = TGT['sessionKey']
-                        self.logger.warning('Using TGT from cache')
+                        self.logger.info('Using TGT from ccache for this principal: %s', spn_kdc_name)
                     else:
-                        raise RuntimeError("Credentials in cache not for target hostname. Cannot continue.")
+                        # CCache provided was actually not a TGT
+                        raise RuntimeError("Credentials in cache not for target hostname. Was looking for [%s or %s] but instead got [%s]. Cannot continue." % (spn_target_name.lower(), spn_kdc_name.lower(), ", ".join([i.header['server'].prettyPrint().decode(errors='ignore').lower() for i in ccache.credentials])))
                 else:
                     # CCache provided is a TGS
                     TGS = creds.toTGS()
-                    self.logger.debug('Using TGS from cache')
+                    domain_of_tgs = domain_from_ccache
+                    self.logger.info('Using TGS from cache for this principal: %s', spn_target_name)
 
 
                 # retrieve user information from CCache file if needed
@@ -447,26 +479,31 @@ class ProxyToServerHelper(ConnectionHandler):
                     user = Principal(user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
                     self.logger.debug('Username retrieved from ccache: %s' % user)
 
-
-        
-        
         if TGS is None :
-           serverName = Principal('HTTP/' + spn, type=constants.PrincipalNameType.NT_SRV_INST.value)
-           try:
-               tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(serverName, domain, kdc_host, tgt, cipher, sessionKey)
-           except KerberosError as e:
-               self.logger.error(f"Cannot get TGS: {e}")
-               raise RuntimeError
+            # We should have a TGT here, we just need to get a TGS
+            spn = Principal(spn_target_name, type=constants.PrincipalNameType.NT_SRV_INST.value)
+            try:
+                # This only works for servers within the same domain as the user,
+                # if you want to do cross domains requests, you have to generate/
+                # ask for the right TGS manually and put it in KRB5CCNAME env var.
+                # Otherwise, one would need to ask for this TGS, the kdc would
+                # give back a TGT to the other domain and re-ask for a TGS, etc,
+                # until we actually get a TGS. -> painful and bloated regarding
+                # the objective of this tool
+                tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(spn, user_creds["domain"], user_creds["kdc_host"], tgt, cipher, sessionKey)
+                domain_of_tgs = user_creds["domain"]
+            except KerberosError as e:
+                self.logger.error(f"Cannot get TGS: {e}")
+                raise RuntimeError
         else:
-           tgs = TGS['KDC_REP']
-           sessionKey = TGS['sessionKey']
-           cipher = TGS['cipher']
+            # We already have a TGS
+            tgs = TGS['KDC_REP']
+            sessionKey = TGS['sessionKey']
+            cipher = TGS['cipher']
 
-
-
+        # Building the AP_REQ
         blob = SPNEGO_NegTokenInit()
         blob['MechTypes'] = [TypesMech['MS KRB5 - Microsoft Kerberos 5'], TypesMech['KRB5 - Kerberos 5'], TypesMech['NEGOEX - SPNEGO Extended Negotiation Security Mechanism'], TypesMech['NTLMSSP - Microsoft NTLM Security Support Provider']]
-
 
         tgs = decoder.decode(tgs, asn1Spec=TGS_REP())[0]
         ticket = Ticket()
@@ -482,7 +519,7 @@ class ProxyToServerHelper(ConnectionHandler):
 
         authenticator = Authenticator()
         authenticator['authenticator-vno'] = 5
-        authenticator['crealm'] = domain
+        authenticator['crealm'] = domain_of_tgs
         seq_set(authenticator, 'cname', user.components_to_asn1)
         now = datetime.datetime.utcnow()
 
@@ -505,7 +542,7 @@ class ProxyToServerHelper(ConnectionHandler):
             # This is the second time we build a NTLM NEGOTIATE message
             # meaning that the authentication failed. We just forward the response
             # to the client
-            raise RuntimeError("Authentication failed, probably bad credentials or server does not support NTLM.")
+            raise RuntimeError("Authentication failed, probably bad credentials or server does not support NTLM or bad EPA (chanel binding or service binding).")
 
         negotiate = getNTLMSSPType1(workstation="", domain="", signingRequired=True)
         #negotiate["flags"] = ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY | ntlm.NTLMSSP_NEGOTIATE_ALWAYS_SIGN | ntlm.NTLMSSP_NEGOTIATE_NTLM | ntlm.NTLM_NEGOTIATE_OEM | ntlm.NTLMSSP_REQUEST_TARGET | ntlm.NTLMSSP_NEGOTIATE_UNICODE
@@ -530,7 +567,7 @@ class ProxyToServerHelper(ConnectionHandler):
             responseKeyNT = ntlm.NTOWFv2(user, password, domain, nthash)
         
             av_pairs = ntlm.AV_PAIRS(serverName)
-            av_pairs[ntlm.NTLMSSP_AV_TARGET_NAME] = 'http/'.encode('utf-16le') + av_pairs[ntlm.NTLMSSP_AV_HOSTNAME][1]
+            av_pairs[ntlm.NTLMSSP_AV_TARGET_NAME] = creds["spn"].encode('utf-16le') if creds["spn"] is not None else f'http/{creds["target"]}'.encode('utf-16le')
             channel_bindings = self.get_channel_bindings()
             if channel_bindings is not None:
                 av_pairs[ntlm.NTLMSSP_AV_CHANNEL_BINDINGS] = channel_bindings
@@ -579,6 +616,7 @@ class ProxyToServerHelper(ConnectionHandler):
         use_ntlm = False
         use_kerberos = False
         token = None
+
         for header_val in www_authenticate:
             if header_val.startswith(b"NTLM") and not self.use_kerberos:
                 use_ntlm = True
@@ -596,6 +634,7 @@ class ProxyToServerHelper(ConnectionHandler):
                 break  # This is the default for Kerberos
 
         if use_ntlm:
+            creds["Used"] = True
             if len(token) == 0:
                 # First 401 from server
                 # Sending NTLM_NEGOTIATE
@@ -619,9 +658,13 @@ class ProxyToServerHelper(ConnectionHandler):
             elif len(token) != 0:
                 # An error occured with the AP_REQ we sent
                 raise RuntimeError("The server responded with an error to our Kerberos authentication. See debug mode for the returned message. You can use analyze_message.sh to analyze it in Wireshark.")
+            elif creds["used"]:
+                # We already tried to authenticated and it did not work as we ended up here again...
+                raise RuntimeError("The server is asking again for Kerberos authentication without details... Probably bad credentials or wrong SPN (when there is service binding).")
 
             # Simply include the kerberos AP_REQ
-            return prepend + self.kerberos_auth(creds["domain"], creds["username"], creds["password"], creds["lmhash"], creds["nthash"], creds["kdc_host"])
+            creds["used"] = True
+            return prepend + self.kerberos_auth(creds)
 
     def send(self, events: List[Union[h11.Response, h11.Data, h11.EndOfMessage]]) -> None:
         """Sending request to remote server."""
@@ -802,7 +845,7 @@ class ClientToProxyHelper(ConnectionHandler):
                 # switched to something else (because we answered 200 to a CONNECT request). Therefore we need to create a
                 # new conn to follow the inner HTTP exchange
             except BrokenPipeError as e:
-                raise RuntimeError("Error while sending 200 OK response during client connection to the proxy") from e
+                raise RuntimeError("Error while sending 200 OK response during client connection to the proxy.") from e
             self.conn = h11.Connection(our_role=h11.SERVER)
 
             # Wrapping in TLS session (MitM), hopping that the client is looking
@@ -856,8 +899,8 @@ class Proxy:
                     self.logger.warning(f"Hash for {hostname if hostname != '_' else 'default website'} as {cred['creds'].split(':')[0]} is not valid")
                     del cred["hashes"]
         
-        self.use_kerberos = use_kerberos # Will perform kerberos authentication if available
-        self.kdc_host = dcip # ip address of the KDC for kerberos authentication
+        self.use_kerberos = use_kerberos  # Will perform kerberos authentication if available
+        self.kdc_host = dcip  # ip address of the KDC for kerberos authentication
 
     def __enter__(self):
         self.logger.debug("Entered proxy, creating sockets.")
@@ -937,7 +980,7 @@ class Proxy:
 
     def _get_creds(self, srv_host):
         h = "_"
-        domain, username, password, nthash, lmhash = None, None, None, None, None
+        domain, username, password, lmhash, nthash, spn = None, None, None, None, None, None
 
         if srv_host in self.creds:
             self.logger.debug("Got credentials for %s.", srv_host)
@@ -952,7 +995,7 @@ class Proxy:
 
         elif "hashes" not in self.creds[h]:
             # len == 1 -> no password, need hash
-            raise RuntimeError(f"No password nor hash for {srv_host}")
+            raise RuntimeError(f"No password nor hash for {srv_host}.")
 
         else:
             # We have the username and the hash
@@ -960,8 +1003,10 @@ class Proxy:
             lmhash = self.creds[h]["lmhash"]
             nthash = self.creds[h]["nthash"]
 
+        spn = self.creds[h]["spn"] if "spn" in self.creds[h] else None
+
         self.logger.debug("Using user %s with password %s or hashes %s:%s for %s.", username, password, lmhash, nthash, srv_host)
-        return domain, username, password, lmhash, nthash
+        return domain, username, password, lmhash, nthash, spn
     
     def split_username(self, username: typing.Optional[str]) -> typing.Tuple[typing.Optional[str], typing.Optional[str]]:
         if username is None:
@@ -1039,7 +1084,7 @@ class Proxy:
 
         # Current status of NTLM authentication for this proxy2server connection (may not be used)
         try:
-            domain, username, password, lmhash, nthash = self._get_creds(srv_host)
+            domain, username, password, lmhash, nthash, spn = self._get_creds(srv_host)
         except Exception as e:
             self.logger.error(f"Improper credentials for {srv_host}: %s", e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
             self._stop_handling()
@@ -1052,7 +1097,12 @@ class Proxy:
             "password": password,
             "lmhash": lmhash if lmhash is not None else "",
             "nthash": nthash if nthash is not None else "",
-            "kdc_host": self.kdc_host
+            "kdc_host": self.kdc_host,
+            "spn": spn,
+            "used": False,
+            # Target specified in the URL by the user
+            # will be used for the SPN in NTLM & Krb auths
+            "target": srv_host
         }
 
         last_loop = False
@@ -1184,6 +1234,7 @@ def main():
 {
     "my.hostname.com": {
         "creds": "domain/user:password",
+        "spn": "HTTP/anothername"
     },
     "my.second.hostname.com": {
         "creds": "domain1/user1",
@@ -1191,13 +1242,16 @@ def main():
     }
 }
 """)
-    parser.add_argument("--default_creds", "-dc", default="./user:password",
+    parser.add_argument("--default-creds", "-dc", default="./user:password",
                         help="Default credentials that will be used to authenticate.")
     parser.add_argument("--hashes", help="Could be used instead of password. It is associated with the domain and username given via --default_creds. format: lmhash:nthash or :nthash")
 
     # Kerberos authentication options
     parser.add_argument("--kerberos", "-k", action="store_true", help="Enable kerberos authentication instead of NTLM")
     parser.add_argument('--dcip', action='store',  help="IP Address of the domain controller (only for kerberos)")
+
+    # SPN options
+    parser.add_argument("--spn", help="Use the provided SPN when an SPN is needed. More details in the article.")
 
 
     args = parser.parse_args()
@@ -1224,10 +1278,11 @@ def main():
             print("Error reading credential file:", e)
             exit(1)
     # Default credentials (arbitrarily associated with hostname "_")
+    credentials.update({"_": {"creds": args.default_creds}})
     if args.hashes is not None:
-        credentials.update({"_": {"creds": args.default_creds, "hashes": args.hashes}})
-    else:
-        credentials.update({"_": {"creds": args.default_creds}})
+        credentials["_"]["hashes"] = args.hashes
+    if args.spn is not None:
+        credentials["_"]["spn"] = args.spn
 
     with Proxy(args.listen_address, args.listen_port, cert_manager, args.dcip, use_kerberos=args.kerberos, is_multiprocess=not args.singleprocess, creds=credentials) as proxy:
         proxy.run()
