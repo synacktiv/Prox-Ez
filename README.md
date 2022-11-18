@@ -1,6 +1,6 @@
-# Prox-Ez
+# Prox-Ez - The Swiss Army Knife of HTTP authentication
 
-The easy proxy to handle your NTLM EPA authentication against webservers.
+This HTTP proxy handles all HTTP authentications on your behalf. It supports NTLM (with EPA), kerberos, pass-the-hash, overpass-the-hash (pass-the-key) and pass-the-ticket (TGT and TGS).
 
 ## Installation
 
