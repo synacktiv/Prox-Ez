@@ -419,11 +419,12 @@ class ProxyToServerHelper(ConnectionHandler):
                 self.logger.warning("No ccache, or invalid, using provided credentials")
                 user = Principal(user_creds["username"], type=constants.PrincipalNameType.NT_PRINCIPAL.value)
                 try:
+                    if user_creds["domain"] == ".":
+                        raise RuntimeError("Trying to perform Kerberos with a local account (no domain specified).")
                     tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(user, user_creds["password"], user_creds["domain"], user_creds["lmhash"], user_creds["nthash"], "", user_creds["kdc_host"])
-                except KerberosError as e:
+                except Exception as e:
                     # Cannot get TGT, exiting
-                    self.logger.error(f"Cannot get TGT: {e}")
-                    raise RuntimeError
+                    raise RuntimeError(f"Cannot get TGT: {e}")
  
             else:
                 # We were able to load the CCache, we need to check if it is a TGT or TGS
@@ -493,8 +494,7 @@ class ProxyToServerHelper(ConnectionHandler):
                 tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(spn, user_creds["domain"], user_creds["kdc_host"], tgt, cipher, sessionKey)
                 domain_of_tgs = user_creds["domain"]
             except KerberosError as e:
-                self.logger.error(f"Cannot get TGS: {e}")
-                raise RuntimeError
+                raise RuntimeError(f"Cannot get TGS: {e}")
         else:
             # We already have a TGS
             tgs = TGS['KDC_REP']
@@ -552,7 +552,7 @@ class ProxyToServerHelper(ConnectionHandler):
 
         return base64.b64encode(negotiate.getData())
 
-    def gen_ntlm_auth(self, creds) -> bytes:
+    def gen_ntlm_auth(self, creds, epa: bool = True) -> bytes:
         """Returns an AUTHENTICATE_MESSAGE from the previous messages."""
 
         def myComputeResponseNTLMv2(flags, serverChallenge, clientChallenge, serverName, domain, user, password, lmhash='', nthash='', use_ntlmv2=ntlm.USE_NTLMv2):
@@ -567,10 +567,19 @@ class ProxyToServerHelper(ConnectionHandler):
             responseKeyNT = ntlm.NTOWFv2(user, password, domain, nthash)
         
             av_pairs = ntlm.AV_PAIRS(serverName)
-            av_pairs[ntlm.NTLMSSP_AV_TARGET_NAME] = creds["spn"].encode('utf-16le') if creds["spn"] is not None else f'http/{creds["target"]}'.encode('utf-16le')
-            channel_bindings = self.get_channel_bindings()
-            if channel_bindings is not None:
-                av_pairs[ntlm.NTLMSSP_AV_CHANNEL_BINDINGS] = channel_bindings
+            if epa:
+                # We add EPA attributes (channel bindings, service binding)
+
+                # Service binding
+                spn = creds["spn"] if creds["spn"] is not None else f'http/{creds["target"]}'
+                self.logger.debug("Using SPN: %s during NTLM authentication", spn)
+                av_pairs[ntlm.NTLMSSP_AV_TARGET_NAME] = spn.encode('utf-16le')
+
+                # Channel bindings
+                channel_bindings = self.get_channel_bindings()
+                if channel_bindings is not None:
+                    av_pairs[ntlm.NTLMSSP_AV_CHANNEL_BINDINGS] = channel_bindings
+
             if av_pairs[ntlm.NTLMSSP_AV_TIME] is not None:
                aTime = av_pairs[ntlm.NTLMSSP_AV_TIME][1]
             else:
@@ -594,7 +603,7 @@ class ProxyToServerHelper(ConnectionHandler):
         auth, exported_session_key = getNTLMSSPType3(self.ntlm_auth["negotiate"], self.ntlm_auth["challenge"], creds["username"], creds["password"] , creds["domain"], creds["lmhash"], creds["nthash"])
         return base64.b64encode(auth.getData())
 
-    def check_auth(self, http_response: List[Union[h11.Response, h11.Data]], creds: Dict[str, str]) -> Union[None, bytes]:
+    def check_auth(self, http_response: List[Union[h11.Response, h11.Data]], creds: Dict[str, str], epa: bool = True) -> Union[None, bytes]:
         """Given an HTTP response, will generate a corresponding NTLM authentication HTTP
         header value or will return None. May raise RuntimeException in case there is a problem.
         """
@@ -648,7 +657,7 @@ class ProxyToServerHelper(ConnectionHandler):
                 # Sending NTLM_AUTH
                 self.logger.debug("Got NTLM CHALLENGE from %s", prepend.decode().strip())
                 self.ntlm_auth["challenge"] = base64.b64decode(token)
-                new_token = self.gen_ntlm_auth(creds)
+                new_token = self.gen_ntlm_auth(creds, epa)
                 return prepend + new_token
         elif use_kerberos:
             if token.startswith(b"oYGh"):
@@ -869,7 +878,7 @@ class Proxy:
     Listens on a local port for SSL connections.
     """
 
-    def __init__(self, listen_address: str, listen_port: int, cert_manager: CertManager, dcip: str="", use_kerberos: bool = False, is_multiprocess: bool = False, creds: dict = None, spn_force_fqdn: bool = False):
+    def __init__(self, listen_address: str, listen_port: int, cert_manager: CertManager, dcip: str="", use_kerberos: bool = False, is_multiprocess: bool = False, creds: dict = None, spn_force_fqdn: bool = False, epa: bool = True):
         self.logger = logging.getLogger("Proxy")
 
         signal.signal(signal.SIGINT, self.interrupted)
@@ -902,6 +911,7 @@ class Proxy:
         self.use_kerberos = use_kerberos  # Will perform kerberos authentication if available
         self.kdc_host = dcip  # IP address of the KDC for kerberos authentication
         self.spn_force_fqdn = spn_force_fqdn  # Force the usage of full FQDN when using SPNs
+        self.epa = epa  # Should we use EPA ?
 
     def __enter__(self):
         self.logger.debug("Entered proxy, creating sockets.")
@@ -987,7 +997,12 @@ class Proxy:
             self.logger.debug("Got credentials for %s.", srv_host)
             h = srv_host
 
-        domain, user_and_pass = self.creds[h]["creds"].split("/", 1)
+        try:
+            domain, user_and_pass = self.creds[h]["creds"].split("/", 1)
+        except ValueError:
+            # No domain specified (no "/" in creds)
+            domain = "."
+            user_and_pass = self.creds[h]["creds"]
 
         splitted = user_and_pass.split(":", 1)
         if len(splitted) == 2:
@@ -1142,7 +1157,7 @@ class Proxy:
 
                 # Check if there is an Authentication header, and generates the corresponding header if so
                 try:
-                    authorization_header = prx2srv_hdler.check_auth(srv_resp, cur_creds)
+                    authorization_header = prx2srv_hdler.check_auth(srv_resp, cur_creds, self.epa)
                 except RuntimeError as e:
                     self.logger.error("Error while performing authentication, stopping. Error details: %s", e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
                     self._stop_handling()
@@ -1255,6 +1270,9 @@ def main():
     parser.add_argument("--spn", help="Use the provided SPN when an SPN is needed. More details in the article.")
     parser.add_argument("--spn-force-fqdn", action='store_true', help="Force the usage of the FQDN as the SPN instead of what was specified in the URL.")
 
+    # EPA
+    parser.add_argument("--no-epa", action='store_false', dest="epa", help="Deactivate the NTLM EPA feature.")
+
 
     args = parser.parse_args()
 
@@ -1286,7 +1304,7 @@ def main():
     if args.spn is not None:
         credentials["_"]["spn"] = args.spn
 
-    with Proxy(args.listen_address, args.listen_port, cert_manager, args.dcip, use_kerberos=args.kerberos, is_multiprocess=not args.singleprocess, creds=credentials, spn_force_fqdn=args.spn_force_fqdn) as proxy:
+    with Proxy(args.listen_address, args.listen_port, cert_manager, args.dcip, use_kerberos=args.kerberos, is_multiprocess=not args.singleprocess, creds=credentials, spn_force_fqdn=args.spn_force_fqdn, epa=args.epa) as proxy:
         proxy.run()
 
 
