@@ -40,9 +40,9 @@ You may also need to disable the socks proxy if enabled.
 $ python3 proxy.py -h
 usage: proxy.py [-h] [--listen-address LISTEN_ADDRESS] [--listen-port LISTEN_PORT] [--cacert CACERT] [--cakey CAKEY]
                 [--cakey-pass CAKEY_PASS] [--certsdir CERTSDIR] [--singleprocess] [--debug] [--creds CREDS]
-                [--default-creds DEFAULT_CREDS] [--hashes HASHES] [--kerberos] [--dcip DCIP] [--spn SPN]
+                [--default-creds DEFAULT_CREDS] [--hashes HASHES] [--kerberos] [--dcip DCIP] [--spn SPN] [--spn-force-fqdn]
 
-Simple HTTP proxy that support NTLM EPA.
+Prox-Ez: The Swiss Army Knife of HTTP auth.
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -63,10 +63,11 @@ optional arguments:
   --default-creds DEFAULT_CREDS, -dc DEFAULT_CREDS
                         Default credentials that will be used to authenticate.
   --hashes HASHES       Could be used instead of password. It is associated with the domain and username given via --default_creds.
-                        format: lmhash:nthash or :nthash
-  --kerberos, -k        Enable kerberos authentication instead of NTLM
-  --dcip DCIP           IP Address of the domain controller (only for kerberos)
+                        format: lmhash:nthash or :nthash.
+  --kerberos, -k        Enable kerberos authentication instead of NTLM.
+  --dcip DCIP           IP Address of the domain controller (only for kerberos).
   --spn SPN             Use the provided SPN when an SPN is needed. More details in the article.
+  --spn-force-fqdn      Force the usage of the FQDN as the SPN instead of what was specified in the URL.
 ```
 
 ### Known issues

@@ -869,7 +869,7 @@ class Proxy:
     Listens on a local port for SSL connections.
     """
 
-    def __init__(self, listen_address: str, listen_port: int, cert_manager: CertManager, dcip: str="", use_kerberos: bool = False, is_multiprocess: bool = False, creds: dict = None):
+    def __init__(self, listen_address: str, listen_port: int, cert_manager: CertManager, dcip: str="", use_kerberos: bool = False, is_multiprocess: bool = False, creds: dict = None, spn_force_fqdn: bool = False):
         self.logger = logging.getLogger("Proxy")
 
         signal.signal(signal.SIGINT, self.interrupted)
@@ -900,7 +900,8 @@ class Proxy:
                     del cred["hashes"]
         
         self.use_kerberos = use_kerberos  # Will perform kerberos authentication if available
-        self.kdc_host = dcip  # ip address of the KDC for kerberos authentication
+        self.kdc_host = dcip  # IP address of the KDC for kerberos authentication
+        self.spn_force_fqdn = spn_force_fqdn  # Force the usage of full FQDN when using SPNs
 
     def __enter__(self):
         self.logger.debug("Entered proxy, creating sockets.")
@@ -1102,7 +1103,7 @@ class Proxy:
             "used": False,
             # Target specified in the URL by the user
             # will be used for the SPN in NTLM & Krb auths
-            "target": srv_host
+            "target": srv_host if not self.spn_force_fqdn or "." in srv_host else srv_host + "." + domain
         }
 
         last_loop = False
@@ -1197,7 +1198,7 @@ def main():
     """
 
     # Parsing command line arguments
-    parser = argparse.ArgumentParser(description="Simple HTTP proxy that support NTLM EPA.")
+    parser = argparse.ArgumentParser(description="Prox-Ez: The Swiss Army Knife of HTTP auth.")
 
     # Proxy listening options
     parser.add_argument("--listen-address", "-l", default="127.0.0.1",
@@ -1244,14 +1245,15 @@ def main():
 """)
     parser.add_argument("--default-creds", "-dc", default="./user:password",
                         help="Default credentials that will be used to authenticate.")
-    parser.add_argument("--hashes", help="Could be used instead of password. It is associated with the domain and username given via --default_creds. format: lmhash:nthash or :nthash")
+    parser.add_argument("--hashes", help="Could be used instead of password. It is associated with the domain and username given via --default_creds. format: lmhash:nthash or :nthash.")
 
     # Kerberos authentication options
-    parser.add_argument("--kerberos", "-k", action="store_true", help="Enable kerberos authentication instead of NTLM")
-    parser.add_argument('--dcip', action='store',  help="IP Address of the domain controller (only for kerberos)")
+    parser.add_argument("--kerberos", "-k", action="store_true", help="Enable kerberos authentication instead of NTLM.")
+    parser.add_argument('--dcip', action='store', help="IP Address of the domain controller (only for kerberos).")
 
     # SPN options
     parser.add_argument("--spn", help="Use the provided SPN when an SPN is needed. More details in the article.")
+    parser.add_argument("--spn-force-fqdn", action='store_true', help="Force the usage of the FQDN as the SPN instead of what was specified in the URL.")
 
 
     args = parser.parse_args()
@@ -1284,7 +1286,7 @@ def main():
     if args.spn is not None:
         credentials["_"]["spn"] = args.spn
 
-    with Proxy(args.listen_address, args.listen_port, cert_manager, args.dcip, use_kerberos=args.kerberos, is_multiprocess=not args.singleprocess, creds=credentials) as proxy:
+    with Proxy(args.listen_address, args.listen_port, cert_manager, args.dcip, use_kerberos=args.kerberos, is_multiprocess=not args.singleprocess, creds=credentials, spn_force_fqdn=args.spn_force_fqdn) as proxy:
         proxy.run()
 
 
