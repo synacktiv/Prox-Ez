@@ -35,9 +35,14 @@ python3 proxy.py -dc mydomain/myusername --hashes :31d6cfe0d16ae931b73c59d7e0c08
 
 ### With BurpSuite
 
-In order to work with burpsuite, disable HTTP/2 support (`Project options` -> `HTTP` -> `HTTP/2` -> uncheck `Enable HTTP/2`) and uncheck `Set response header "Connection: close"` (`Proxy` -> `Options` -> `Miscellaneous` -> uncheck `Set response header "Connection: close"`) as NTLM authenticate a TCP connection.
-Afterwards, you just have to specify an upstream proxy in burp, so that it uses this proxy for the host you cannot authenticate with (in `Project options` -> `Connections` -> `Upstream Proxy Servers` -> click `Add` -> specify the remote hostname that is causing problems with NTLM authentication, the proxy host and port configured in the tool and leave the `Authentication type` to `None`).
-You may also need to disable the socks proxy if enabled.
+In order to work with burpsuite:
+* Disable HTTP/2 support: `Project options` -> `HTTP` -> `HTTP/2` -> uncheck `Enable HTTP/2`
+* Uncheck `Set response header "Connection: close"` as NTLM authenticate a TCP connection: `Proxy` -> `Options` -> `Miscellaneous` -> uncheck `Set response header "Connection: close"`.
+* Uncheck `Set "Connection" header on incoming requests when using HTTP/1`: `Proxy` -> `Options` -> `Miscellaneous` -> uncheck `Set "Connection" header on incoming requests when using HTTP/1`
+
+Afterwards, you just have to specify an upstream proxy in burp, so that it uses this proxy for the host you cannot authenticate with:
+- In `Project options` -> `Connections` -> `Upstream Proxy Servers` -> click `Add` -> specify the remote hostname that is causing problems with NTLM authentication, the proxy host and port configured in the tool and leave the `Authentication type` to `None`.
+- You may also need to disable the socks proxy if enabled.
 
 ### Help
 
