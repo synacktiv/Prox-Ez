@@ -194,14 +194,14 @@ class ConnectionHandler:
             response = h11.Response(status_code=500, reason=b"Internal error", headers=[(b"Connection", b"close")])
             try:
                 self._send([response, h11.EndOfMessage()])
-            except BrokenPipeError:
+            except (BrokenPipeError, ConnectionResetError):
                 pass
 
         data = self.conn.send(h11.ConnectionClosed())
         if data is not None:
             try:
                 self.curr_sock.sendall(data)
-            except BrokenPipeError:
+            except (BrokenPipeError, ConnectionResetError):
                 pass
 
         try:
@@ -858,7 +858,7 @@ class ClientToProxyHelper(ConnectionHandler):
                 self.send([connect_response])  # No EndOfMessage here as h11 thinks its job is done here, protocol is
                 # switched to something else (because we answered 200 to a CONNECT request). Therefore we need to create a
                 # new conn to follow the inner HTTP exchange
-            except BrokenPipeError as e:
+            except (BrokenPipeError, ConnectionResetError) as e:
                 raise RuntimeError("Error while sending 200 OK response during client connection to the proxy.") from e
             self.conn = h11.Connection(our_role=h11.SERVER)
 
@@ -1142,7 +1142,7 @@ class Proxy:
                 # Perform authentication
                 try:
                     prx2srv_hdler.send(clt_events)
-                except BrokenPipeError:
+                except (BrokenPipeError, ConnectionResetError):
                     self.logger.warning("Server closed connection while sending packets to it.")
                     self._stop_handling()
                     return
@@ -1187,7 +1187,7 @@ class Proxy:
             # Sending the server response back to the client
             try:
                 clt2prx_hdler.send(srv_resp)
-            except BrokenPipeError as e:
+            except (BrokenPipeError, ConnectionResetError) as e:
                 self.logger.warning("Could not send the response to the client.")
                 self._stop_handling()
                 return
