@@ -556,6 +556,9 @@ class ProxyToServerHelper(ConnectionHandler):
     def gen_ntlm_auth(self, creds, epa: bool = True) -> bytes:
         """Returns an AUTHENTICATE_MESSAGE from the previous messages."""
 
+        if creds["password"] is None and creds["lmhash"] == "" and creds["nthash"] == "":
+            raise RuntimeError("No password, nor hashes given for NTLM authentication, cannot authenticate.")
+
         def myComputeResponseNTLMv2(flags, serverChallenge, clientChallenge, serverName, domain, user, password, lmhash='', nthash='', use_ntlmv2=ntlm.USE_NTLMv2):
             """Rewriten method to override the default Impacket one as it does
             not allow to specify the correct target name (always "cifs/..."),
@@ -1013,7 +1016,7 @@ class Proxy:
 
         elif "hashes" not in self.creds[h]:
             # len == 1 -> no password, need hash
-            raise RuntimeError(f"No password nor hash for {srv_host}.")
+            self.logger.warning("No password nor hash given for %s.", srv_host)
 
         else:
             # We have the username and the hash
