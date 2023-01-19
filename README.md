@@ -6,7 +6,7 @@ It supports NTLM EPA (channel binding and service binding), kerberos, pass-the-h
 
 Related articles:
 - [Dissecting NTLM EPA with love & building a MitM proxy](https://www.synacktiv.com/publications/dissecting-ntlm-epa-with-love-building-a-mitm-proxy.html)
-- Coming soon...
+- [A study on Windows HTTP authentication (Part II)](https://www.synacktiv.com/publications/a-study-on-windows-http-authentication-part-ii.html)
 
 ## Installation
 
