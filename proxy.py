@@ -801,7 +801,10 @@ class ClientToProxyHelper(ConnectionHandler):
 
         self.logger.debug("Wrapping initial client to proxy socket")
 
-        self.ssock = self.context.wrap_socket(sock=self.sock, server_side=True)
+        try:
+            self.ssock = self.context.wrap_socket(sock=self.sock, server_side=True)
+        except ssl.SSLError:
+            raise RuntimeError("Cannot TLS wrap the socket between your browser and this proxy, is the Prox-Ez CA correctly installed in your browser?")
 
         self.curr_sock = self.ssock
         self.logger.debug("Wrapped")
