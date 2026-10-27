@@ -44,12 +44,14 @@ from h11 import LocalProtocolError, RemoteProtocolError
 
 #Manage Kerberos
 
-from impacket.spnego import ASN1_AID, SPNEGO_NegTokenInit, SPNEGO_NegTokenResp, TypesMech
+from impacket.spnego import ASN1_AID, ASN1_OID, asn1encode, SPNEGO_NegTokenInit, SPNEGO_NegTokenResp, TypesMech
 from impacket.krb5.asn1 import AP_REQ, Authenticator, TGS_REP, seq_set
 from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS
 from impacket.krb5.types import Principal, KerberosTime, Ticket
 from impacket.krb5.ccache import CCache
 from impacket.krb5.kerberosv5 import KerberosError
+from impacket.krb5.gssapi import CheckSumField, KRB5_AP_REQ, GSS_C_MUTUAL_FLAG, \
+    GSS_C_REPLAY_FLAG, GSS_C_SEQUENCE_FLAG, GSS_C_CONF_FLAG, GSS_C_INTEG_FLAG
 from impacket.krb5 import constants
 from impacket.ntlm import getNTLMSSPType1, getNTLMSSPType3
 from impacket import ntlm
@@ -526,6 +528,18 @@ class ProxyToServerHelper(ConnectionHandler):
 
         authenticator['cusec'] = now.microsecond
         authenticator['ctime'] = KerberosTime.to_asn1(now)
+
+        # RFC 4121 GSS-API checksum. Windows SSPI accepts an authenticator without
+        # it, but Java acceptors (Okta agentless DSSO) reject the AP_REQ.
+        chkField = CheckSumField()
+        chkField['Lgth'] = 16
+        chkField['Flags'] = GSS_C_MUTUAL_FLAG | GSS_C_REPLAY_FLAG | GSS_C_SEQUENCE_FLAG \
+            | GSS_C_CONF_FLAG | GSS_C_INTEG_FLAG
+        authenticator['cksum'] = noValue
+        authenticator['cksum']['cksumtype'] = 0x8003
+        authenticator['cksum']['checksum'] = chkField.getData()
+        authenticator['seq-number'] = 0
+
         encodedAuthenticator = encoder.encode(authenticator)
         encryptedEncodedAuthenticator = cipher.encrypt(sessionKey, 11, encodedAuthenticator, None)
 
@@ -533,7 +547,12 @@ class ProxyToServerHelper(ConnectionHandler):
         apReq['authenticator']['etype'] = cipher.enctype
         apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
 
-        blob['MechToken'] = encoder.encode(apReq)
+        # The mechToken must be a full GSS-API InitialContextToken (RFC 2743):
+        # [APPLICATION 0] { KRB5 mech OID, TOK_ID 0x0100, AP_REQ }. A bare AP_REQ
+        # is accepted by Windows SSPI but rejected by MIT/Java acceptors.
+        blob['MechToken'] = struct.pack('B', ASN1_AID) + asn1encode(
+            struct.pack('B', ASN1_OID) + asn1encode(TypesMech['KRB5 - Kerberos 5'])
+            + KRB5_AP_REQ + encoder.encode(apReq))
         return base64.b64encode(blob.getData())
 
     def gen_ntlm_negotiate(self) -> bytes:
@@ -811,6 +830,8 @@ class ClientToProxyHelper(ConnectionHandler):
 
     def prepare(self, request_list: List[Union[h11.Request, h11.Data]]) -> Tuple[str, int]:
 
+        if not len(request_list):
+            return (None, None)
         request = request_list[0]
         target_parsed = urlparse(request.target)
         if target_parsed.netloc == b"":
@@ -1059,6 +1080,8 @@ class Proxy:
         # Establish TLS if needed (between client and proxy)
         try:
             srv_host, srv_port = clt2prx_hdler.prepare(clt_events)
+            if (srv_host, srv_port) == (None, None):
+                return
         except ssl.SSLError as e:
             self.logger.error("SSL Error: %s", e, exc_info=self.logger.getEffectiveLevel() == logging.DEBUG)
             self._stop_handling()
@@ -1137,9 +1160,24 @@ class Proxy:
                 # No request received from client/connection was closed
                 break
 
+            if any(header == b"upgrade" for header, _ in clt_events[0].headers):
+                # No websocket support, and forwarding the upgrade would switch the h11
+                # connections to a protocol we cannot speak, which trips the state
+                # assertions in recv(). Drop the connection instead.
+                self.logger.info("Dropping protocol upgrade request to %s.", srv_host)
+                for hdler in (clt2prx_hdler, prx2srv_hdler):
+                    try:
+                        hdler.stop()
+                    except Exception:
+                        pass
+                return
+
             # Removing proxy headers
             clt_events[0] = self._remove_proxy_headers(clt_events[0])
 
+            # Authentication is per request: a keep-alive connection may carry several
+            # requests, each getting its own challenge.
+            cur_creds["used"] = False
             init_req = clt_events[0]
             while True:
                 # Perform authentication
